@@ -103,6 +103,7 @@ if st.session_state["result"] is not None:
                 st.caption("未调用")
                 
     # 3. 其他展示模块
+    # 3. 其他展示模块
     st.subheader("PubMed 检索结果 (摘要，不等于全文)")
     for item in r.get("evidence", []):
         st.markdown(f"[{item.get('title', '无标题')}]({item.get('url', '#')}) · PMID {item.get('pmid', '未知')}")
@@ -112,10 +113,44 @@ if st.session_state["result"] is not None:
     
     st.subheader("分歧审查")
     st.write(r.get("disagreement_review", "无"))
+
+    # ================= 新增：生成并展示报告 =================
+    # 拼接报告内容
+    report_lines = []
+    report_lines.append("# MediCouncil 辅助决策报告\n")
     
+    report_lines.append("## 建议追问")
+    for q in r.get("questions", []):
+        report_lines.append(f"- {q}")
+    
+    report_lines.append("\n## 双模型独立分析")
+    for op in r.get("opinions", []):
+        provider_name = op.get("provider", "未知模型").capitalize()
+        report_lines.append(f"### {provider_name}")
+        if op.get("error"):
+            report_lines.append(f"【错误信息】: {op['error']}")
+        elif op.get("content"):
+            report_lines.append(op['content'])
+        else:
+            report_lines.append("无内容")
+    
+    report_lines.append("\n## 证据核查")
+    report_lines.append(r.get("evidence_review", "无"))
+    
+    report_lines.append("\n## 分歧审查")
+    report_lines.append(r.get("disagreement_review", "无"))
+    
+    report_text = "\n".join(report_lines)
+
+    # 在页面上直接显示完整报告
+    st.subheader("📄 生成的辅助报告")
+    st.markdown(report_text) # 将报告直接渲染在页面中
+
+    # 下载按钮（数据源改为我们真正拼接好的 report_text）
     st.download_button(
         label="下载辅助报告 TXT",
-        data="这里是报告内容", # 替换为你实际的报告生成逻辑
+        data=report_text, 
         file_name="medicouncil_report.txt",
         mime="text/plain"
+    )
     )
