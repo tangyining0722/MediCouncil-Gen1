@@ -1,16 +1,26 @@
-import streamlit as st
+ import streamlit as st
 import os
 import time
+import json
 from openai import OpenAI
 
 # 页面配置
 st.set_page_config(page_title="MediCouncil 智能辅助诊断", layout="wide")
 st.title("MediCouncil 智能辅助诊断系统")
-st.caption("请在左侧输入您的症状，即使只有一句话，AI 也会为您生成完整的分析和就医指南。")
 
-# ================= 安全获取密钥 =================
+# 初始化 Session State（用于管理多步交互）
+if "step" not in st.session_state:
+    st.session_state.step = 1
+if "symptoms" not in st.session_state:
+    st.session_state.symptoms = ""
+if "questions_json" not in st.session_state:
+    st.session_state.questions_json = []
+if "answers" not in st.session_state:
+    st.session_state.answers = {}
+if "final_report" not in st.session_state:
+    st.session_state.final_report = ""
+
 def get_api_key(key_name):
-    # 优先从 Render 环境变量读取，其次从 Streamlit Secrets 读取
     key = os.environ.get(key_name)
     if not key:
         try:
@@ -19,31 +29,45 @@ def get_api_key(key_name):
             pass
     return key
 
-# ================= 核心 Prompt 定义 =================
+# 严格限制为临床导向的 Prompt
 SYSTEM_PROMPT = """
-你是一位三甲医院的资深全科医生。用户可能会提供非常简短甚至模糊的症状描述（如“我头疼”）。
-请不要抱怨信息不足，而是基于你丰富的临床经验，像真正的医生一样进行“顺藤摸瓜”式的推理。
+你是一位三甲医院的资深全科医生。请严格遵守以下规则：
+1. 必须围绕临床医学、器质性病变和常见躯体疾病进行推理。
+2. 严禁将非器质性心理状态（如追星、不想上班、FOMO）作为主要诊断，除非患者明确提及并伴有严重的生理症状。
+3. 语言要专业、通俗，直接给出就医指导，不要写段子或编造幽默诊断。
 
-请严格按照以下 Markdown 格式输出一份专业、通俗、让人能看懂的报告：
-### 1. 预诊断概述
-（简要说明根据当前症状，最可能的几种情况，并安抚患者情绪）
-
-### 2. 可能疾病及概率排序
-（列出3-5种可能的疾病，按可能性从高到低排序，并给出粗略的概率百分比。例如：1. 紧张性头痛（概率约60%）：由于...引起。）
-
-### 3. 就诊建议
-（明确建议挂什么科室，建议做哪些检查，以及在就诊前可以做什么来缓解。如果是紧急症状，请立刻用加粗字体警告就医！）
-
-请注意：必须使用通俗易懂的语言，避免过多生涩的医学术语，同时保持专业度。
+输出格式要求：必须只输出一个标准的 JSON 格式数据，不要包含任何 Markdown 代码块标记（如 ```json ）。
+JSON 结构必须如下：
+{
+  "questions": [
+    {
+      "id": "q1",
+      "text": "疼痛的具体性质是什么？",
+      "options": ["搏动性跳痛", "持续性钝痛", "刺痛", "其他"]
+    },
+    {
+      "id": "q2",
+      "text": "伴随症状有哪些？",
+      "options": ["无", "恶心/呕吐", "发热", "视力模糊"]
+    }
+  ]
+}
+请根据患者的初步症状，生成 3-5 个最关键的选择题。选项不要超过4个。
 """
 
-# ================= 真实调用 API =================
-def call_deepseek(symptoms):
+REPORT_PROMPT = """
+你是一位三甲医院的资深全科医生。请根据患者提供的基础症状和后续的选择题回答，生成一份最终的医学辅助报告。
+报告必须包含：
+1. 预诊断概述（根据现有信息，给出综合判断，安抚情绪）
+2. 可能疾病及概率排序（列出3-5种，按可能性从高到低，标注粗略概率）
+3. 就诊建议（建议挂什么科室，做什么检查，就诊前如何缓解，如果有紧急危险信号必须用加粗字体警告）
+
+请使用通俗易懂且专业的语言，输出 Markdown 格式。
+"""
+
+def call_deepseek_for_questions(symptoms):
     try:
         api_key = get_api_key("DEEPSEEK_API_KEY")
-        if not api_key:
-            return "【错误】未配置 DeepSeek API Key"
-        
         client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
         response = client.chat.completions.create(
             model="deepseek-chat",
@@ -51,76 +75,97 @@ def call_deepseek(symptoms):
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": f"患者症状：{symptoms}"}
             ],
-            temperature=0.7,
+            temperature=0.3,
         )
-        return response.choices[0].message.content
+        # 清理可能存在的 Markdown 标记
+        raw_text = response.choices[0].message.content.strip()
+        if raw_text.startswith("```json"): raw_text = raw_text[7:]
+        if raw_text.startswith("```"): raw_text = raw_text[3:]
+        if raw_text.endswith("```"): raw_text = raw_text[:-3]
+        
+        return json.loads(raw_text.strip())
     except Exception as e:
-        return f"【调用失败】{str(e)}"
+        st.error(f"生成追问问题失败: {str(e)}")
+        return None
 
-def call_doubao(symptoms, deepseek_result):
-    """
-    让豆包作为“专家会诊”，对DeepSeek的诊断进行补充和复核。
-    """
+def call_ai_for_report(symptoms, answers_text):
     try:
-        api_key = get_api_key("DOUBAO_API_KEY")
-        if not api_key:
-            return "" # 如果没有配置豆包，静默返回空
-        
-        # 使用火山方舟的 API 地址
-        client = OpenAI(api_key=api_key, base_url="https://ark.cn-beijing.volces.com/api/v3")
-        
-        prompt = f"""
-        患者症状：{symptoms}
-        另一位AI医生给出的初步分析如下：
-        {deepseek_result}
-        
-        请基于上述信息，以“专家补充建议”的身份，补充分析中遗漏的可能疾病，并给出更细致的日常护理建议。
-        输出格式要求：不要重复已有的分析，直接列出补充的内容，标题为“### 4. 专家补充与护理建议”。
-        """
-        
-        # 使用你截图中的真实模型 ID
+        api_key = get_api_key("DEEPSEEK_API_KEY")
+        client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
+        final_input = f"基础症状：{symptoms}\n追问回答：{answers_text}"
         response = client.chat.completions.create(
-            model="doubao-seed-2.1-lite-260915", 
+            model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "你是一位资深医学专家，负责对初步诊断进行查漏补缺和护理指导。"},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": REPORT_PROMPT},
+                {"role": "user", "content": final_input}
             ],
             temperature=0.5,
         )
         return response.choices[0].message.content
     except Exception as e:
-        # 如果豆包报错，返回空字符串，不让错误信息显示在页面上
-        return ""
+        return f"【调用失败】{str(e)}"
 
-# ================= 界面交互 =================
+# ================= 界面渲染逻辑 =================
+
+# 侧边栏，可以放重置按钮
 with st.sidebar:
     st.header("患者信息录入")
-    symptoms = st.text_area("请输入患者主诉、现病史等（简单一句话即可）：", height=150, placeholder="例如：我头疼，晚上睡觉流口水...")
-    analyze_button = st.button("开始智能分析", type="primary")
+    if st.button("🔄 重新开始一次诊断"):
+        st.session_state.step = 1
+        st.session_state.symptoms = ""
+        st.session_state.questions_json = []
+        st.session_state.answers = {}
+        st.session_state.final_report = ""
+        st.rerun()
 
-if analyze_button:
-    if not symptoms.strip():
-        st.warning("请先输入您的症状哦～")
-    else:
-        with st.spinner("双模型协作推理中，正在为您生成高质量报告..."):
-            # 1. 调用 DeepSeek 进行首轮预诊断
-            deepseek_result = call_deepseek(symptoms)
-            
-            # 2. 调用豆包进行专家补充
-            doubao_result = call_doubao(symptoms, deepseek_result)
-            
-            # 3. 合并结果，隐藏中间过程，直接展示一份完整的报告
-            final_report = deepseek_result + "\n\n" + doubao_result
-            
-            st.success("✅ 分析完成！")
-            st.markdown("---")
-            # 直接渲染最终报告
-            st.markdown(final_report)
-            
-            # 提供下载按钮
-            st.download_button(
-                label="下载辅助报告 TXT",
-                data=final_report,
-                file_name="medicouncil_report.txt",
-                mime="text/plain"
-            )
+# 步骤一：输入初始症状
+if st.session_state.step == 1:
+    symptoms = st.text_area("请输入您的基础症状（一句话即可，例如：我头疼，晚上睡觉流口水）：", height=150, value=st.session_state.symptoms)
+    if st.button("下一步：生成追问", type="primary"):
+        if not symptoms.strip():
+            st.warning("请先输入您的症状哦～")
+        else:
+            st.session_state.symptoms = symptoms
+            with st.spinner("AI 正在为您生成关键追问..."):
+                questions_data = call_deepseek_for_questions(symptoms)
+                if questions_data and "questions" in questions_data:
+                    st.session_state.questions_json = questions_data["questions"]
+                    st.session_state.step = 2
+                    st.rerun()
+                else:
+                    st.error("生成追问失败，请检查 API 或网络。")
+
+# 步骤二：回答选择题
+elif st.session_state.step == 2:
+    st.subheader("请您补充以下关键信息")
+    st.info("为了让诊断更精确，请回答以下几个问题：")
+    
+    answers = {}
+    for q in st.session_state.questions_json:
+        q_text = q.get("text", "未知问题")
+        options = q.get("options", ["是", "否"])
+        # 使用 selectbox 或 radio 渲染选择题
+        answer = st.radio(q_text, options, index=None, key=q.get("id"))
+        answers[q_text] = answer
+        
+    if st.button("确认回答，生成报告", type="primary"):
+        # 检查是否所有题目都回答了
+        if None in answers.values():
+            st.warning("请回答所有问题后再点击确认。")
+        else:
+            st.session_state.answers = answers
+            with st.spinner("双模型协作中，正在为您生成深度分析报告..."):
+                # 将回答拼接成文本
+                answers_text = "\n".join([f"问：{k}\n答：{v}" for k, v in answers.items()])
+                report = call_ai_for_report(st.session_state.symptoms, answers_text)
+                st.session_state.final_report = report
+                st.session_state.step = 3
+                st.rerun()
+
+# 步骤三：展示最终报告
+elif st.session_state.step == 3:
+    st.success("✅ 分析完成！以下是为您生成的辅助诊断报告")
+    st.markdown("---")
+    st.markdown(st.session_state.final_report)
+    st.markdown("---")
+    st.download_button("下载辅助报告 TXT", st.session_state.final_report, "medicouncil_report.txt", "text/plain")
