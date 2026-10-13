@@ -1,18 +1,14 @@
 import streamlit as st
 import os
 import time
-import requests
-import json
+from openai import OpenAI  # 需要用到 openai 库，DeepSeek 和豆包都兼容
 
 # 页面配置
-st.set_page_config(page_title="MediCouncil 第一代", layout="wide")
-st.title("MediCouncil 第一代 (通用医疗协同决策教育原型)")
+st.set_page_config(page_title="MediCouncil 智能辅助诊断", layout="wide")
+st.title("MediCouncil 智能辅助诊断系统")
+st.caption("请在左侧输入您的症状，即使只有一句话，AI 也会为您生成完整的分析和就医指南。")
 
-# 初始化 session_state
-if "result" not in st.session_state:
-    st.session_state["result"] = None
-
-# 安全获取密钥的函数（兼容 Render 和 Streamlit）
+# ================= 安全获取密钥 =================
 def get_api_key(key_name):
     # 优先从 Render 环境变量读取，其次从 Streamlit Secrets 读取
     key = os.environ.get(key_name)
@@ -23,116 +19,101 @@ def get_api_key(key_name):
             pass
     return key
 
-# 模拟双模型调用
-def call_ai_model(provider, prompt):
+# ================= 核心 Prompt 定义 =================
+# 告诉大模型：不要抱怨信息少，要利用专业知识做推理
+SYSTEM_PROMPT = """
+你是一位三甲医院的资深全科医生。用户可能会提供非常简短甚至模糊的症状描述（如“我头疼”）。
+请不要抱怨信息不足，而是基于你丰富的临床经验，像真正的医生一样进行“顺藤摸瓜”式的推理。
+
+请严格按照以下 Markdown 格式输出一份专业、通俗、让人能看懂的报告：
+### 1. 预诊断概述
+（简要说明根据当前症状，最可能的几种情况，并安抚患者情绪）
+
+### 2. 可能疾病及概率排序
+（列出3-5种可能的疾病，按可能性从高到低排序，并给出粗略的概率百分比。例如：1. 紧张性头痛（概率约60%）：由于...引起。）
+
+### 3. 就诊建议
+（明确建议挂什么科室，建议做哪些检查，以及在就诊前可以做什么来缓解。如果是紧急症状，请立刻用红色字体警告就医！）
+
+请注意：必须使用通俗易懂的语言，避免过多生涩的医学术语，同时保持专业度。
+"""
+
+# ================= 真实调用 API =================
+def call_deepseek(symptoms):
     try:
-        if provider == "deepseek":
-            api_key = get_api_key("DEEPSEEK_API_KEY")
-            if not api_key:
-                return {"error": "未配置 DeepSeek API Key，请在 Render 环境变量中设置 DEEPSEEK_API_KEY"}
-            
-            # 这里替换为你实际的 DeepSeek API 调用代码
-            # 实际调用时需要携带 api_key，例如：
-            # headers = {"Authorization": f"Bearer {api_key}"}
-            # 为演示，此处直接返回模拟结果，以便你确认界面正常
-            return {"content": "DeepSeek 分析结果：根据患者症状，建议进行进一步的心血管检查。"}
-            
-        elif provider == "doubao":
-            api_key = get_api_key("DOUBAO_API_KEY")
-            if not api_key:
-                return {"error": "未配置豆包 API Key，请在 Render 环境变量中设置 DOUBAO_API_KEY"}
-            
-            # 这里替换为你实际的豆包 API 调用代码
-            return {"content": "豆包分析结果：建议结合既往病史，重点关注血压和血糖指标。"}
-            
+        api_key = get_api_key("DEEPSEEK_API_KEY")
+        if not api_key:
+            return "【错误】未配置 DeepSeek API Key"
+        
+        client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
+        response = client.chat.completions.create(
+            model="deepseek-chat", # 或者 deepseek-reasoner
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"患者症状：{symptoms}"}
+            ],
+            temperature=0.7, # 适当提高一点温度，增加推理的广度
+        )
+        return response.choices[0].message.content
     except Exception as e:
-        return {"error": f"调用 {provider} 失败: {str(e)}"}
+        return f"【调用失败】{str(e)}"
 
-    return {"error": f"{provider} 未返回任何数据"}
+def call_doubao(symptoms, deepseek_result):
+    """
+    为了让双模型发挥更好的作用，我们可以让豆包作为“专家会诊”，对DeepSeek的诊断进行补充和复核。
+    或者也可以让豆包独立生成一份，然后拼接。这里为了减少冗余，让豆包做补充。
+    """
+    try:
+        api_key = get_api_key("DOUBAO_API_KEY")
+        if not api_key:
+            return "【错误】未配置豆包 API Key"
+        
+        # 豆包 (火山引擎) 的 base_url 通常类似 https://ark.cn-beijing.volces.com/api/v3
+        # 请填入你自己的 endpoint ID 或模型名称，这里假设为 doubao-pro
+        client = OpenAI(api_key=api_key, base_url="https://ark.cn-beijing.volces.com/api/v3")
+        
+        prompt = f"""
+        患者症状：{symptoms}
+        另一位AI医生给出的初步分析如下：
+        {deepseek_result}
+        
+        请基于上述信息，以“专家补充建议”的身份，补充分析中遗漏的可能疾病，并给出更细致的日常护理建议。
+        输出格式要求：不要重复已有的分析，直接列出补充的内容，标题为“### 4. 专家补充与护理建议”。
+        """
+        
+        response = client.chat.completions.create(
+            model="ep-2024xxxxxx", # 注意：这里必须填你在火山引擎创建的推理接入点(Endpoint ID)，通常是 ep- 开头
+            messages=[
+                {"role": "system", "content": "你是一位资深医学专家，负责对初步诊断进行查漏补缺和护理指导。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.5,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"【调用失败】{str(e)}"
 
-# 侧边栏输入
+# ================= 界面交互 =================
 with st.sidebar:
     st.header("患者信息录入")
-    symptoms = st.text_area("请输入患者主诉、现病史等：", height=150)
-    analyze_button = st.button("开始协同决策分析", type="primary")
+    symptoms = st.text_area("请输入患者主诉、现病史等（简单一句话即可）：", height=150)
+    analyze_button = st.button("开始智能分析", type="primary")
 
-# 主界面逻辑
-if analyze_button and symptoms:
-    with st.spinner("正在调用双模型进行独立分析..."):
-        time.sleep(1.0) # 模拟网络延迟
-        
-        prompt = f"患者症状：{symptoms}。请给出医疗建议。"
-        
-        deepseek_result = call_ai_model("deepseek", prompt)
-        doubao_result = call_ai_model("doubao", prompt)
-        
-        st.session_state["result"] = {
-            "warnings": ["妊娠或产后头痛，伴血压高、水肿、上腹痛、视物模糊。"],
-            "questions": ["症状从什么时候开始？是否突然出现或持续加重？", "具体部位、严重程度和伴随症状是什么？"],
-            "opinions": [
-                {"provider": "deepseek", **deepseek_result},
-                {"provider": "doubao", **doubao_result}
-            ],
-            "evidence": [],
-            "evidence_review": "证据核查通过。",
-            "disagreement_review": "双模型分歧审查：两者建议方向一致，无显著分歧。"
-        }
-
-# 展示结果
-if st.session_state["result"] is not None:
-    r = st.session_state["result"]
-    
-    # 1. 建议追问
-    st.subheader("建议追问")
-    for q in r.get("questions", []):
-        st.write(f"• {q}")
-        
-    # 2. 双模型独立分析
-    st.subheader("双模型独立分析")
-    cols = st.columns(2)
-    
-    for i, provider in enumerate(["deepseek", "doubao"]):
-        with cols[i]:
-            st.markdown(f"**{provider.capitalize()}**")
-            match = next((x for x in r.get("opinions", []) if x.get("provider") == provider), None)
+if analyze_button:
+    if not symptoms.strip():
+        st.warning("请先输入您的症状哦～")
+    else:
+        with st.spinner("双模型协作推理中，正在为您生成高质量报告..."):
+            # 1. 调用 DeepSeek 进行首轮预诊断
+            deepseek_result = call_deepseek(symptoms)
             
-            if match:
-                if hasattr(match, 'error') and match.error:
-                    st.error(match.error)
-                elif hasattr(match, 'content'):
-                    st.write(match.content)
-                else:
-                    st.write(match)
-            else:
-                st.caption("未调用")
-                
-    # 3. 其他展示模块
-    st.subheader("PubMed 检索结果 (摘要，不等于全文)")
-    for item in r.get("evidence", []):
-        st.markdown(f"[{item.get('title', '无标题')}]({item.get('url', '#')}) · PMID {item.get('pmid', '未知')}")
-        
-    st.subheader("证据核查")
-    st.write(r.get("evidence_review", "无"))
-    
-    st.subheader("分歧审查")
-    st.write(r.get("disagreement_review", "无"))
-
-    # ================= 新增：生成并展示报告 =================
-    report_lines = []
-    report_lines.append("# MediCouncil 辅助决策报告\n")
-    report_lines.append("## 建议追问")
-    for q in r.get("questions", []):
-        report_lines.append(f"- {q}")
-    
-    report_lines.append("\n## 双模型独立分析")
-    for op in r.get("opinions", []):
-        report_lines.append(f"### {op.get('provider', '未知模型').capitalize()}")
-        if op.get("error"): report_lines.append(f"【错误信息】: {op['error']}")
-        elif op.get("content"): report_lines.append(op['content'])
-    
-    report_text = "\n".join(report_lines)
-
-    st.subheader("📄 生成的辅助报告")
-    st.markdown(report_text)
-
-    st.download_button("下载辅助报告 TXT", report_text, "medicouncil_report.txt", "text/plain")
+            # 2. 调用豆包进行专家补充
+            doubao_result = call_doubao(symptoms, deepseek_result)
+            
+            # 3. 合并结果，隐藏中间过程，直接展示一份完整的报告
+            final_report = deepseek_result + "\n\n" + doubao_result
+            
+            st.success("✅ 分析完成！")
+            st.markdown("---")
+            # 直接渲染最终报告
+            st.markdown(final_report)
