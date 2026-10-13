@@ -36,7 +36,13 @@ with tab1:
             with cols[i]:
                 st.markdown("**"+provider+"**")
                 match=next((x for x in r.opinions if x.provider==provider),None)
-                if match: st.error(match.error) if match.error else st.write(match.content)
+                if match:
+                if hasattr(match, 'error') and match.error:
+                    st.error(match.error)
+                elif hasattr(match, 'content'):
+                    st.write(match.content)
+                else:
+                    st.write(match)
                 else: st.caption("未调用")
         st.subheader("PubMed 检索结果（摘要，不等于全文）")
         for item in r.evidence:
