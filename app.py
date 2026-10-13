@@ -29,14 +29,14 @@ def get_api_key(key_name):
     return key
 
 # ================= 核心 Prompt =================
-# 让 AI 自己判断是否需要追问，并且强制 JSON 输出
+# 调整了部分提示，明确告知大模型选项支持多选
 SYSTEM_PROMPT = """
 你是一位三甲医院的资深全科医生。你的任务是根据患者的症状，进行临床推理。
 请严格遵守以下规则：
 1. 必须围绕临床医学、器质性病变进行推理，严禁编造娱乐化、心理化的虚假诊断（如“演唱会渴望综合征”）。
 2. 每次接收用户输入，你都必须优先输出一份【诊断报告】。
 3. 然后，评估患者提供的信息是否足够。如果信息太模糊（例如只有“我头疼”），你需要提出最多3个针对性的追问问题。如果信息已经足够，则不需要追问。
-4. 追问必须是选择题形式（提供选项）或者简短填空形式，方便患者快速回答。
+4. 追问必须是提供选项的选择题形式（患者可以从中选择一个甚至多个选项），或者简短填空形式，方便患者快速回答。
 
 你必须且只能输出一个标准的 JSON 格式，不要包含任何 Markdown 代码块标记（如 ```json ）。
 JSON 结构必须严格如下：
@@ -45,12 +45,12 @@ JSON 结构必须严格如下：
   "questions": [
     {
       "id": "q1",
-      "text": "疼痛的具体性质是什么？",
+      "text": "疼痛的具体性质是什么？（可多选）",
       "options": ["搏动性跳痛", "持续性钝痛", "刺痛", "其他"]
     },
     {
       "id": "q2",
-      "text": "伴随症状有哪些？",
+      "text": "伴随症状有哪些？（可多选）",
       "options": ["无", "恶心/呕吐", "发热", "视力模糊"]
     }
   ]
@@ -73,10 +73,9 @@ def call_ai_doctor(messages, max_questions=3):
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=api_messages,
-            temperature=0.3, # 降低随机性，保证诊断的严谨性
+            temperature=0.3,
         )
         
-        # 清理可能存在的 Markdown 标记
         raw_text = response.choices[0].message.content.strip()
         if raw_text.startswith("```json"): raw_text = raw_text[7:]
         if raw_text.startswith("```"): raw_text = raw_text[3:]
@@ -84,7 +83,6 @@ def call_ai_doctor(messages, max_questions=3):
         
         result = json.loads(raw_text.strip())
         
-        # 强制限制最多返回3个问题
         if "questions" in result and len(result["questions"]) > max_questions:
             result["questions"] = result["questions"][:max_questions]
             
@@ -104,7 +102,7 @@ with st.sidebar:
         st.session_state.input_text = ""
         st.rerun()
 
-# 侧边栏显示历史记录（可选）
+# 侧边栏问诊历史
 with st.sidebar:
     st.markdown("---")
     st.subheader("问诊历史")
@@ -112,7 +110,6 @@ with st.sidebar:
         if msg["role"] == "user":
             st.caption(f"🙋 患者：{msg['content']}")
         elif msg["role"] == "assistant":
-            # 助手消息是JSON，只显示报告部分的前两行做摘要
             try:
                 data = json.loads(msg["content"])
                 st.caption(f"👨‍⚕️ 医生：{data.get('report', '')[:50]}...")
@@ -136,13 +133,13 @@ if not st.session_state.messages:
                 st.session_state.messages.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
                 st.rerun()
 
-# 如果已有报告，直接展示
+# 展示当前报告
 if st.session_state.report:
     st.markdown("### 📋 诊断报告")
     st.markdown(st.session_state.report)
     st.markdown("---")
 
-# 处理追问逻辑
+# 处理追问逻辑 (多选版)
 if st.session_state.questions and st.session_state.round < 3:
     st.subheader(f"请您补充以下信息（第 {st.session_state.round + 1} 轮，最多 3 轮）")
     
@@ -152,9 +149,11 @@ if st.session_state.questions and st.session_state.round < 3:
         for q in st.session_state.questions:
             q_text = q.get("text", "未知问题")
             options = q.get("options", [])
+            
+            # 判断类型并渲染组件
             if options:
-                # 如果有选项，用 radio
-                answers[q_text] = st.radio(q_text, options, index=None, key=f"{q.get('id')}_{st.session_state.round}")
+                # 【修改点】：改为多选，允许用户选择一个甚至多个选项
+                answers[q_text] = st.multiselect(q_text, options, key=f"{q.get('id')}_{st.session_state.round}")
             else:
                 # 没选项就用 text_input
                 answers[q_text] = st.text_input(q_text, key=f"{q.get('id')}_{st.session_state.round}")
@@ -162,12 +161,29 @@ if st.session_state.questions and st.session_state.round < 3:
         submit_answers = st.form_submit_button("提交补充信息")
         
         if submit_answers:
-            # 检查是否所有问题都回答了
-            if any(v is None or v == "" for v in answers.values()):
-                st.warning("请回答所有问题后再提交。")
+            # 【修改点】：多选情况的空值判断
+            is_valid = True
+            for v in answers.values():
+                if isinstance(v, list) and len(v) == 0:
+                    is_valid = False
+                    break
+                elif isinstance(v, str) and v.strip() == "":
+                    is_valid = False
+                    break
+            
+            if not is_valid:
+                st.warning("请至少选择一个选项或填写内容后再提交。")
             else:
-                # 记录用户回答
-                answers_text = "\n".join([f"问：{k}\n答：{v}" for k, v in answers.items()])
+                # 【修改点】：将列表格式的答案转换为顿号分隔的字符串，拼接给大模型
+                formatted_answers = []
+                for k, v in answers.items():
+                    if isinstance(v, list):
+                        val_text = "、".join(v) # 例如："搏动性跳痛、伴随恶心"
+                    else:
+                        val_text = v
+                    formatted_answers.append(f"问：{k}\n答：{val_text}")
+                    
+                answers_text = "\n".join(formatted_answers)
                 st.session_state.messages.append({"role": "user", "content": f"补充信息：\n{answers_text}"})
                 st.session_state.round += 1
                 
