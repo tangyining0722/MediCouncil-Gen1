@@ -1,7 +1,7 @@
 import streamlit as st
 import os
 import time
-from openai import OpenAI  # 需要用到 openai 库，DeepSeek 和豆包都兼容
+from openai import OpenAI
 
 # 页面配置
 st.set_page_config(page_title="MediCouncil 智能辅助诊断", layout="wide")
@@ -20,7 +20,6 @@ def get_api_key(key_name):
     return key
 
 # ================= 核心 Prompt 定义 =================
-# 告诉大模型：不要抱怨信息少，要利用专业知识做推理
 SYSTEM_PROMPT = """
 你是一位三甲医院的资深全科医生。用户可能会提供非常简短甚至模糊的症状描述（如“我头疼”）。
 请不要抱怨信息不足，而是基于你丰富的临床经验，像真正的医生一样进行“顺藤摸瓜”式的推理。
@@ -33,7 +32,7 @@ SYSTEM_PROMPT = """
 （列出3-5种可能的疾病，按可能性从高到低排序，并给出粗略的概率百分比。例如：1. 紧张性头痛（概率约60%）：由于...引起。）
 
 ### 3. 就诊建议
-（明确建议挂什么科室，建议做哪些检查，以及在就诊前可以做什么来缓解。如果是紧急症状，请立刻用红色字体警告就医！）
+（明确建议挂什么科室，建议做哪些检查，以及在就诊前可以做什么来缓解。如果是紧急症状，请立刻用加粗字体警告就医！）
 
 请注意：必须使用通俗易懂的语言，避免过多生涩的医学术语，同时保持专业度。
 """
@@ -47,12 +46,12 @@ def call_deepseek(symptoms):
         
         client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
         response = client.chat.completions.create(
-            model="deepseek-chat", # 或者 deepseek-reasoner
+            model="deepseek-chat",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": f"患者症状：{symptoms}"}
             ],
-            temperature=0.7, # 适当提高一点温度，增加推理的广度
+            temperature=0.7,
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -60,16 +59,14 @@ def call_deepseek(symptoms):
 
 def call_doubao(symptoms, deepseek_result):
     """
-    为了让双模型发挥更好的作用，我们可以让豆包作为“专家会诊”，对DeepSeek的诊断进行补充和复核。
-    或者也可以让豆包独立生成一份，然后拼接。这里为了减少冗余，让豆包做补充。
+    让豆包作为“专家会诊”，对DeepSeek的诊断进行补充和复核。
     """
     try:
         api_key = get_api_key("DOUBAO_API_KEY")
         if not api_key:
-            return "【错误】未配置豆包 API Key"
+            return "" # 如果没有配置豆包，静默返回空
         
-        # 豆包 (火山引擎) 的 base_url 通常类似 https://ark.cn-beijing.volces.com/api/v3
-        # 请填入你自己的 endpoint ID 或模型名称，这里假设为 doubao-pro
+        # 使用火山方舟的 API 地址
         client = OpenAI(api_key=api_key, base_url="https://ark.cn-beijing.volces.com/api/v3")
         
         prompt = f"""
@@ -81,8 +78,9 @@ def call_doubao(symptoms, deepseek_result):
         输出格式要求：不要重复已有的分析，直接列出补充的内容，标题为“### 4. 专家补充与护理建议”。
         """
         
+        # 使用你截图中的真实模型 ID
         response = client.chat.completions.create(
-            model="ep-2024xxxxxx", # 注意：这里必须填你在火山引擎创建的推理接入点(Endpoint ID)，通常是 ep- 开头
+            model="doubao-seed-2.1-lite-260915", 
             messages=[
                 {"role": "system", "content": "你是一位资深医学专家，负责对初步诊断进行查漏补缺和护理指导。"},
                 {"role": "user", "content": prompt}
@@ -91,12 +89,13 @@ def call_doubao(symptoms, deepseek_result):
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"【调用失败】{str(e)}"
+        # 如果豆包报错，返回空字符串，不让错误信息显示在页面上
+        return ""
 
 # ================= 界面交互 =================
 with st.sidebar:
     st.header("患者信息录入")
-    symptoms = st.text_area("请输入患者主诉、现病史等（简单一句话即可）：", height=150)
+    symptoms = st.text_area("请输入患者主诉、现病史等（简单一句话即可）：", height=150, placeholder="例如：我头疼，晚上睡觉流口水...")
     analyze_button = st.button("开始智能分析", type="primary")
 
 if analyze_button:
@@ -117,3 +116,11 @@ if analyze_button:
             st.markdown("---")
             # 直接渲染最终报告
             st.markdown(final_report)
+            
+            # 提供下载按钮
+            st.download_button(
+                label="下载辅助报告 TXT",
+                data=final_report,
+                file_name="medicouncil_report.txt",
+                mime="text/plain"
+            )
