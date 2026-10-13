@@ -147,10 +147,4 @@ if st.session_state["result"] is not None:
     st.markdown(report_text) # 将报告直接渲染在页面中
 
     # 下载按钮（数据源改为我们真正拼接好的 report_text）
-    st.download_button(
-        label="下载辅助报告 TXT",
-        data=report_text, 
-        file_name="medicouncil_report.txt",
-        mime="text/plain"
-    )
-    )
+    st.download_button("下载辅助报告 TXT", report_text, "medicouncil_report.txt", "text/plain")
