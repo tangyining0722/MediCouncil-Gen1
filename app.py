@@ -3,6 +3,7 @@ import os
 import json
 import requests
 import xml.etree.ElementTree as ET
+import uuid
 from openai import OpenAI
 
 # 页面配置
@@ -75,7 +76,6 @@ def search_pubmed(query, max_results=3):
 
 # ================= 核心逻辑 =================
 def evaluate_and_assign(messages_history):
-    # 强制只使用 DeepSeek
     return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "deepseek"}
 
 def generate_report_and_questions(messages_history, route_info, current_round):
@@ -101,13 +101,11 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     """
     doctor_response = call_llm(role_a, "你是一位专业的医疗诊断医生。", doctor_prompt, json_mode=True)
     
-    # 【重点修复】安全提取 JSON 数据
     try:
         doctor_data = json.loads(doctor_response.strip().replace("```json", "").replace("```", ""))
-        if not isinstance(doctor_data, dict) or "report" not in doctor_data:
-            doctor_data = {"report": str(doctor_data) if doctor_data else "报告解析异常", "questions": []}
+        if not isinstance(doctor_data, dict): doctor_data = {}
     except:
-        doctor_data = {"report": "报告解析失败，请检查 API 返回格式。", "questions": []}
+        doctor_data = {}
 
     quality_prompt = f"""
     你是一位严苛的医疗质控专家。请审查另一位医生对以下患者的诊断报告。
@@ -123,15 +121,33 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     """
     quality_response = call_llm(role_b, "你是一位严苛的医疗质控专家。", quality_prompt, json_mode=True)
     
-    # 【重点修复】安全提取质控后的数据
     try:
         final_data = json.loads(quality_response.strip().replace("```json", "").replace("```", ""))
-        if not isinstance(final_data, dict) or "report" not in final_data:
-            final_data = doctor_data # 如果质控失败，回退使用初诊数据
+        if not isinstance(final_data, dict): final_data = {}
     except:
-        final_data = doctor_data
+        final_data = {}
         
-    return final_data
+    # 【核心修复】：清洗问题列表，防止 None 报错
+    raw_questions = final_data.get("questions", [])
+    cleaned_questions = []
+    for idx, q in enumerate(raw_questions):
+        if not isinstance(q, dict): continue
+        q_text = q.get("text", f"问题 {idx + 1}")
+        if not q_text or q_text == "未知问题": 
+            q_text = f"请补充相关信息 {idx + 1}"
+        options = q.get("options", [])
+        # 生成唯一的 ID，绝对不重复
+        q_id = q.get("id") or f"q_{uuid.uuid4().hex[:8]}_{idx}"
+        cleaned_questions.append({
+            "id": q_id,
+            "text": q_text,
+            "options": options
+        })
+    
+    # 如果质控没有返回报告，就用初诊的兜底
+    report_text = final_data.get("report") or doctor_data.get("report") or "报告生成异常，请重试。"
+    
+    return {"report": report_text, "questions": cleaned_questions}
 
 # ================= 终局：PubMed 校对 =================
 def verify_with_pubmed(report_content, role_b):
@@ -198,15 +214,23 @@ if st.session_state.questions and st.session_state.round < 3:
         for q in st.session_state.questions:
             q_text = q.get("text", "未知问题")
             options = q.get("options", [])
+            # 使用清洗后的 q_id 作为 key，绝对不重复
+            q_key = f"key_{q.get('id')}_{st.session_state.round}"
+            
             if options:
-                answers[q_text] = st.multiselect(q_text, options, key=f"{q.get('id')}_{st.session_state.round}")
+                answers[q_text] = st.multiselect(q_text, options, key=q_key)
             else:
-                answers[q_text] = st.text_input(q_text, key=f"{q.get('id')}_{st.session_state.round}")
+                answers[q_text] = st.text_input(q_text, key=q_key)
                 
         submit_answers = st.form_submit_button("提交补充信息")
         
         if submit_answers:
-            is_valid = all(isinstance(v, list) and len(v) > 0 or isinstance(v, str) and v.strip() != "" for v in answers.values())
+            # 严格校验用户是否回答
+            is_valid = True
+            for v in answers.values():
+                if isinstance(v, list) and len(v) == 0: is_valid = False
+                elif isinstance(v, str) and v.strip() == "": is_valid = False
+                
             if not is_valid:
                 st.warning("请至少选择一个选项或填写内容后再提交。")
             else:
