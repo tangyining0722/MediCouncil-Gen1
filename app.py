@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 import uuid
 from openai import OpenAI
 
-# 页面配置
+# ================= 页面配置 =================
 st.set_page_config(page_title="MediCouncil 智能辅助诊断", layout="wide")
 st.title("MediCouncil 智能辅助诊断系统")
 
@@ -16,7 +16,7 @@ if "report" not in st.session_state: st.session_state.report = ""
 if "questions" not in st.session_state: st.session_state.questions = []
 if "round" not in st.session_state: st.session_state.round = 0
 if "pubmed_done" not in st.session_state: st.session_state.pubmed_done = False
-if "asked_questions" not in st.session_state: st.session_state.asked_questions = [] # 记录问过的问题
+if "asked_questions" not in st.session_state: st.session_state.asked_questions = [] # 记录问过的历史问题，用于去重
 
 def get_api_key(key_name):
     key = os.environ.get(key_name)
@@ -37,7 +37,8 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
             api_key = get_api_key("DOUBAO_API_KEY")
             if not api_key: return '{"error": "豆包 API Key 未配置"}'
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
-            model_id = "doubao-seed-2.1-lite-260915"
+            # 【注意】若豆包报错 404，请去火山引擎创建接入点，将 ep- 开头的 ID 替换这里
+            model_id = "doubao-seed-2.1-lite-260915" 
         else:
             return '{"error": "模型名称错误"}'
 
@@ -75,16 +76,39 @@ def search_pubmed(query, max_results=3):
     except:
         return ""
 
-# ================= 核心逻辑 =================
+# ================= 核心逻辑：动态路由 =================
 def evaluate_and_assign(messages_history):
-    return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "deepseek"}
+    # 静默检查豆包 Key 是否存在，若无则全部交给 DeepSeek，保证网站绝对不崩
+    has_doubao = bool(get_api_key("DOUBAO_API_KEY"))
+    if not has_doubao:
+        return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "deepseek"}
+    
+    history_text = "".join([f"{'患者' if m['role']=='user' else '医生'}：{m['content']}\n" for m in messages_history])
+    router_prompt = f"""
+    以下是问诊对话历史：
+    {history_text}
+    请分析当前病例的复杂程度。
+    1. 如果症状单一、常见，定义复杂度为 "low"。
+    2. 如果症状涉及多系统、存在潜在风险、或者表述非常模糊，定义复杂度为 "high"。
+    根据复杂度，请决定以下角色的分配（必须同时调用两个模型）：
+    - 角色A（主诊医生）：负责生成核心诊断报告。
+    - 角色B（质控专家）：负责严苛审查角色A的报告。
+    请只输出 JSON 格式：{{"complexity": "low/high", "role_a_model": "deepseek/doubao", "role_b_model": "deepseek/doubao"}}
+    """
+    res = call_llm("deepseek", "你是一个医疗分诊调度系统。", router_prompt, json_mode=True)
+    try:
+        data = json.loads(res.strip().replace("```json", "").replace("```", ""))
+        if "role_a_model" not in data or "role_b_model" not in data:
+            raise ValueError("格式错误")
+        return data
+    except:
+        return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "doubao"}
 
+# ================= 核心逻辑：报告生成与追问 =================
 def generate_report_and_questions(messages_history, route_info, current_round):
     role_a = route_info["role_a_model"]
     role_b = route_info["role_b_model"]
     context = "\n".join([f"{'患者' if m['role']=='user' else '医生'}：{m['content']}" for m in messages_history])
-    
-    # 提取已经问过的问题，作为警告发给大模型
     asked_questions_text = "、".join(st.session_state.asked_questions) if st.session_state.asked_questions else "无"
 
     ask_instructions = ""
@@ -138,7 +162,7 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     except:
         final_data = {}
         
-    # 【核心修复】：清洗问题列表，去重且防报错
+    # 清洗问题列表，防止 None 报错，并硬性去重
     raw_questions = final_data.get("questions", [])
     cleaned_questions = []
     for idx, q in enumerate(raw_questions):
@@ -147,28 +171,17 @@ def generate_report_and_questions(messages_history, route_info, current_round):
         if not q_text or q_text == "未知问题": 
             q_text = f"请补充相关信息 {idx + 1}"
         
-        # 硬性去重：如果这个问题在前几轮问过了，直接跳过
         if q_text in st.session_state.asked_questions:
             continue
             
         options = q.get("options", [])
         q_id = q.get("id") or f"q_{uuid.uuid4().hex[:8]}_{idx}"
-        cleaned_questions.append({
-            "id": q_id,
-            "text": q_text,
-            "options": options
-        })
+        cleaned_questions.append({"id": q_id, "text": q_text, "options": options})
     
-    # 如果去重后没有新问题了，强制清空 questions 触发 PubMed 结束流程
-    if not cleaned_questions:
-        cleaned_questions = []
-    
-    # 记录这一轮新问的问题
     for cq in cleaned_questions:
         st.session_state.asked_questions.append(cq["text"])
     
     report_text = final_data.get("report") or doctor_data.get("report") or "报告生成异常，请重试。"
-    
     return {"report": report_text, "questions": cleaned_questions}
 
 # ================= 终局：PubMed 校对 =================
@@ -209,7 +222,7 @@ with st.sidebar:
         st.rerun()
 
 if not st.session_state.messages:
-    st.info("请在下方描述您的基础症状")
+    st.info("请在下方描述您的基础症状（系统将根据病情复杂度，动态分配双模型进行交叉验证）")
     initial_symptom = st.text_area("症状描述：", height=100, key="initial_input")
     
     if st.button("开始智能分析", type="primary"):
@@ -217,7 +230,7 @@ if not st.session_state.messages:
             st.warning("请先输入您的症状哦～")
         else:
             st.session_state.messages.append({"role": "user", "content": initial_symptom})
-            with st.spinner("AI 医生正在调度模型进行深度分析..."):
+            with st.spinner("AI 医生正在调度双模型进行深度分析..."):
                 route_info = evaluate_and_assign(st.session_state.messages)
                 result = generate_report_and_questions(st.session_state.messages, route_info, st.session_state.round)
                 st.session_state.report = result.get("report", "")
@@ -231,7 +244,7 @@ if st.session_state.report:
     st.markdown("---")
 
 if st.session_state.questions and st.session_state.round < 3:
-    st.subheader(f"请您补充以下信息（第 {st.session_state.round + 1} 轮）")
+    st.subheader(f"请您补充以下信息（第 {st.session_state.round + 1} 轮，最多 3 轮）")
     with st.form(key=f"follow_up_form_{st.session_state.round}"):
         answers = {}
         for q in st.session_state.questions:
@@ -267,10 +280,10 @@ if st.session_state.questions and st.session_state.round < 3:
                     st.session_state.messages.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
                     st.rerun()
 
-# 触发 PubMed 的条件：轮次达到3轮，或者没有新的追问问题了
+# 当轮次达到3轮，或者没有新的追问问题了，触发 PubMed 校对
 if (st.session_state.round >= 3 or not st.session_state.questions) and st.session_state.report and not st.session_state.pubmed_done:
     st.session_state.pubmed_done = True
-    with st.spinner("正在调用 PubMed 进行终极文献校对..."):
+    with st.spinner("正在调用 PubMed 进行终极文献校对（约需 10-15 秒），请稍候..."):
         route_info = evaluate_and_assign(st.session_state.messages)
         role_b = route_info["role_b_model"]
         verified_report = verify_with_pubmed(st.session_state.report, role_b)
