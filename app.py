@@ -7,8 +7,8 @@ import uuid
 from openai import OpenAI
 
 # ================= 页面配置 =================
-st.set_page_config(page_title="MediCouncil 智能辅助诊断", layout="wide")
-st.title("MediCouncil 智能辅助诊断系统")
+st.set_page_config(page_title="人工智能辅助会诊系统", layout="wide")
+st.title("人工智能辅助会诊系统")
 
 # ================= 状态管理初始化 =================
 if "messages" not in st.session_state: st.session_state.messages = []
@@ -19,7 +19,6 @@ if "pubmed_done" not in st.session_state: st.session_state.pubmed_done = False
 if "asked_questions" not in st.session_state: st.session_state.asked_questions = []
 
 def get_api_key(key_name):
-    # 优先从 Render 环境变量读取，其次从 Streamlit Secrets 读取
     key = os.environ.get(key_name)
     if not key:
         try: key = st.secrets[key_name]
@@ -38,7 +37,7 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
             api_key = get_api_key("DOUBAO_API_KEY")
             if not api_key: return '{"error": "豆包 API Key 未配置"}'
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
-            # 【如果此处报错 404，请去火山引擎“在线推理-接入点”创建，用 ep- 开头的 ID 替换下面的 model_id】
+            # 若豆包报错 404，请去火山引擎创建接入点，将 ep- 开头的 ID 替换这里
             model_id = "doubao-seed-2.1-lite-260915" 
         else:
             return '{"error": "模型名称错误"}'
@@ -87,7 +86,7 @@ def evaluate_and_assign(messages_history):
     router_prompt = f"""
     以下是问诊对话历史：
     {history_text}
-    请分析当前病例的复杂程度。如果症状单一、常见，定义复杂度为 "low"；如果症状涉及多系统、存在潜在风险，定义复杂度为 "high"。
+    请分析当前病例的复杂程度。如果症状单一、常见，定义复杂度为 "low"；如果症状涉及多系统、存在潜在风险、定义复杂度为 "high"。
     根据复杂度，请决定以下角色的分配（必须同时调用两个模型）：
     - 角色A（主诊医生）：负责生成核心诊断报告。
     - 角色B（质控专家）：负责严苛审查角色A的报告。
@@ -204,7 +203,7 @@ def verify_with_pubmed(report_content, role_b):
 # ================= 界面交互流程 =================
 with st.sidebar:
     st.header("患者信息录入")
-    if st.button("🔄 重新开始一次诊断"):
+    if st.button("🔄 重新开始一次会诊"):
         st.session_state.messages = []
         st.session_state.report = ""
         st.session_state.questions = []
@@ -217,12 +216,12 @@ if not st.session_state.messages:
     st.info("请在下方描述您的基础症状（系统将根据病情复杂度，动态分配双模型进行交叉验证）")
     initial_symptom = st.text_area("症状描述：", height=100, key="initial_input")
     
-    if st.button("开始智能分析", type="primary"):
+    if st.button("开始智能会诊", type="primary"):
         if not initial_symptom.strip():
             st.warning("请先输入您的症状哦～")
         else:
             st.session_state.messages.append({"role": "user", "content": initial_symptom})
-            with st.spinner("AI 医生正在调度双模型进行深度分析..."):
+            with st.spinner("AI 医生正在调度双模型进行深度会诊..."):
                 route_info = evaluate_and_assign(st.session_state.messages)
                 result = generate_report_and_questions(st.session_state.messages, route_info, st.session_state.round)
                 st.session_state.report = result.get("report", "")
@@ -231,7 +230,7 @@ if not st.session_state.messages:
                 st.rerun()
 
 if st.session_state.report:
-    st.markdown("### 📋 交叉验证诊断报告")
+    st.markdown("### 📋 交叉验证会诊报告")
     st.markdown(st.session_state.report)
     st.markdown("---")
 
@@ -282,7 +281,7 @@ if (st.session_state.round >= 3 or not st.session_state.questions) and st.sessio
 
 if st.session_state.round >= 3 or (not st.session_state.questions and st.session_state.pubmed_done):
     st.info("已达到最大追问轮次（3轮）。以上是基于现有信息和医学文献核查的最全面分析，请结合报告尽快就医。")
-    if st.button("🔄 重新开始一次诊断"):
+    if st.button("🔄 重新开始一次会诊"):
         st.session_state.messages = []
         st.session_state.report = ""
         st.session_state.questions = []
@@ -292,4 +291,4 @@ if st.session_state.round >= 3 or (not st.session_state.questions and st.session
         st.rerun()
 
 if st.session_state.report:
-    st.download_button("下载最终报告 TXT", st.session_state.report, "medicouncil_final_report.txt", "text/plain")
+    st.download_button("下载会诊报告 TXT", st.session_state.report, "ai_consultation_report.txt", "text/plain")
