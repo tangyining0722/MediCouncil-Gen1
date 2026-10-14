@@ -16,9 +16,10 @@ if "report" not in st.session_state: st.session_state.report = ""
 if "questions" not in st.session_state: st.session_state.questions = []
 if "round" not in st.session_state: st.session_state.round = 0
 if "pubmed_done" not in st.session_state: st.session_state.pubmed_done = False
-if "asked_questions" not in st.session_state: st.session_state.asked_questions = [] # 记录问过的历史问题，用于去重
+if "asked_questions" not in st.session_state: st.session_state.asked_questions = []
 
 def get_api_key(key_name):
+    # 优先从 Render 环境变量读取，其次从 Streamlit Secrets 读取
     key = os.environ.get(key_name)
     if not key:
         try: key = st.secrets[key_name]
@@ -37,7 +38,7 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
             api_key = get_api_key("DOUBAO_API_KEY")
             if not api_key: return '{"error": "豆包 API Key 未配置"}'
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
-            # 【注意】若豆包报错 404，请去火山引擎创建接入点，将 ep- 开头的 ID 替换这里
+            # 【如果此处报错 404，请去火山引擎“在线推理-接入点”创建，用 ep- 开头的 ID 替换下面的 model_id】
             model_id = "doubao-seed-2.1-lite-260915" 
         else:
             return '{"error": "模型名称错误"}'
@@ -78,7 +79,6 @@ def search_pubmed(query, max_results=3):
 
 # ================= 核心逻辑：动态路由 =================
 def evaluate_and_assign(messages_history):
-    # 静默检查豆包 Key 是否存在，若无则全部交给 DeepSeek，保证网站绝对不崩
     has_doubao = bool(get_api_key("DOUBAO_API_KEY"))
     if not has_doubao:
         return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "deepseek"}
@@ -87,9 +87,7 @@ def evaluate_and_assign(messages_history):
     router_prompt = f"""
     以下是问诊对话历史：
     {history_text}
-    请分析当前病例的复杂程度。
-    1. 如果症状单一、常见，定义复杂度为 "low"。
-    2. 如果症状涉及多系统、存在潜在风险、或者表述非常模糊，定义复杂度为 "high"。
+    请分析当前病例的复杂程度。如果症状单一、常见，定义复杂度为 "low"；如果症状涉及多系统、存在潜在风险，定义复杂度为 "high"。
     根据复杂度，请决定以下角色的分配（必须同时调用两个模型）：
     - 角色A（主诊医生）：负责生成核心诊断报告。
     - 角色B（质控专家）：负责严苛审查角色A的报告。
@@ -98,8 +96,7 @@ def evaluate_and_assign(messages_history):
     res = call_llm("deepseek", "你是一个医疗分诊调度系统。", router_prompt, json_mode=True)
     try:
         data = json.loads(res.strip().replace("```json", "").replace("```", ""))
-        if "role_a_model" not in data or "role_b_model" not in data:
-            raise ValueError("格式错误")
+        if "role_a_model" not in data or "role_b_model" not in data: raise ValueError("格式错误")
         return data
     except:
         return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "doubao"}
@@ -117,8 +114,7 @@ def generate_report_and_questions(messages_history, route_info, current_round):
         4. 追问机制：提出最多3个针对性的追问问题。问题必须是选择题形式（提供选项，可多选），或简短填空。
         5. 【极其重要】你之前已经问过以下问题，绝对不允许再次提问完全一样的问题：
         历史问题：{asked_questions_text}
-        请根据目前的问诊历史，提出新的、不同的关键问题。
-        如果信息已经足够，或者你无法提出新的问题，请直接将 questions 数组留空 []。
+        请根据目前的问诊历史，提出新的、不同的关键问题。如果信息已经足够，请直接将 questions 数组留空 []。
         """
     else:
         ask_instructions = "4. 已达到最大追问轮次，不要再生成追问，questions 数组必须为空 []。"
@@ -162,17 +158,13 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     except:
         final_data = {}
         
-    # 清洗问题列表，防止 None 报错，并硬性去重
     raw_questions = final_data.get("questions", [])
     cleaned_questions = []
     for idx, q in enumerate(raw_questions):
         if not isinstance(q, dict): continue
         q_text = q.get("text", f"问题 {idx + 1}")
-        if not q_text or q_text == "未知问题": 
-            q_text = f"请补充相关信息 {idx + 1}"
-        
-        if q_text in st.session_state.asked_questions:
-            continue
+        if not q_text or q_text == "未知问题": q_text = f"请补充相关信息 {idx + 1}"
+        if q_text in st.session_state.asked_questions: continue
             
         options = q.get("options", [])
         q_id = q.get("id") or f"q_{uuid.uuid4().hex[:8]}_{idx}"
@@ -251,7 +243,6 @@ if st.session_state.questions and st.session_state.round < 3:
             q_text = q.get("text", "未知问题")
             options = q.get("options", [])
             q_key = f"key_{q.get('id')}_{st.session_state.round}"
-            
             if options:
                 answers[q_text] = st.multiselect(q_text, options, key=q_key)
             else:
@@ -264,7 +255,6 @@ if st.session_state.questions and st.session_state.round < 3:
             for v in answers.values():
                 if isinstance(v, list) and len(v) == 0: is_valid = False
                 elif isinstance(v, str) and v.strip() == "": is_valid = False
-                
             if not is_valid:
                 st.warning("请至少选择一个选项或填写内容后再提交。")
             else:
@@ -280,7 +270,6 @@ if st.session_state.questions and st.session_state.round < 3:
                     st.session_state.messages.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
                     st.rerun()
 
-# 当轮次达到3轮，或者没有新的追问问题了，触发 PubMed 校对
 if (st.session_state.round >= 3 or not st.session_state.questions) and st.session_state.report and not st.session_state.pubmed_done:
     st.session_state.pubmed_done = True
     with st.spinner("正在调用 PubMed 进行终极文献校对（约需 10-15 秒），请稍候..."):
