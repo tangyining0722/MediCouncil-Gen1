@@ -33,9 +33,7 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
             model_id = "deepseek-chat"
         elif model_name == "doubao":
             api_key = get_api_key("DOUBAO_API_KEY")
-            if not api_key: 
-                # 如果豆包密钥不存在，直接返回空，不报错
-                return '{"error": "豆包 API Key 未配置或已删除"}'
+            if not api_key: return '{"error": "豆包 API Key 未配置"}'
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
             model_id = "doubao-seed-2.1-lite-260915"
         else:
@@ -72,38 +70,17 @@ def search_pubmed(query, max_results=3):
             abstract = " ".join([t.text for t in abstract_texts if t.text]) if abstract_texts else "No Abstract"
             abstracts.append(f"标题：{title}\n摘要：{abstract[:600]}...")
         return "\n\n".join(abstracts)
-    except Exception as e:
+    except:
         return ""
 
 # ================= 核心逻辑 =================
 def evaluate_and_assign(messages_history):
-    # 【核心修复】：如果检测不到豆包的 Key，强制只使用 DeepSeek，不再分配给豆包任何角色
-    has_doubao = bool(get_api_key("DOUBAO_API_KEY"))
-    if not has_doubao:
-        return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "deepseek"}
-
-    history_text = "".join([f"{'患者' if m['role']=='user' else '医生'}：{m['content']}\n" for m in messages_history])
-    router_prompt = f"""
-    以下是问诊对话历史：
-    {history_text}
-    请分析当前病例的复杂程度。
-    1. 如果症状单一、常见，定义复杂度为 "low"。
-    2. 如果症状涉及多系统、存在潜在风险、或者表述非常模糊，定义复杂度为 "high"。
-    根据复杂度，请决定以下角色的分配（必须同时调用两个模型）：
-    - 角色A（主诊医生）：负责生成核心诊断报告。
-    - 角色B（质控专家）：负责严苛审查角色A的报告。
-    请只输出 JSON 格式：{{"complexity": "low/high", "role_a_model": "deepseek/doubao", "role_b_model": "deepseek/doubao"}}
-    """
-    res = call_llm("deepseek", "你是一个医疗分诊调度系统。", router_prompt, json_mode=True)
-    try:
-        return json.loads(res.strip().replace("```json", "").replace("```", ""))
-    except:
-        return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "doubao"}
+    # 强制只使用 DeepSeek
+    return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "deepseek"}
 
 def generate_report_and_questions(messages_history, route_info, current_round):
     role_a = route_info["role_a_model"]
     role_b = route_info["role_b_model"]
-    complexity = route_info["complexity"]
     context = "\n".join([f"{'患者' if m['role']=='user' else '医生'}：{m['content']}" for m in messages_history])
 
     ask_instructions = """
@@ -119,30 +96,38 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     2. 必须围绕临床医学、器质性病变进行推理，严禁编造娱乐化诊断。
     3. 当前是第 {current_round + 1} 轮（最多3轮）。
     {ask_instructions}
-    请只输出标准 JSON 格式（不要 Markdown 代码块）：
+    请只输出标准 JSON 格式：
     {{"report": "Markdown格式的报告内容", "questions": [ {{"id": "q1", "text": "问题1？", "options": ["选项A", "选项B"]}} ]}}
     """
     doctor_response = call_llm(role_a, "你是一位专业的医疗诊断医生。", doctor_prompt, json_mode=True)
+    
+    # 【重点修复】安全提取 JSON 数据
     try:
         doctor_data = json.loads(doctor_response.strip().replace("```json", "").replace("```", ""))
+        if not isinstance(doctor_data, dict) or "report" not in doctor_data:
+            doctor_data = {"report": str(doctor_data) if doctor_data else "报告解析异常", "questions": []}
     except:
-        doctor_data = {"report": "诊断生成失败，请检查 API 连接。", "questions": []}
+        doctor_data = {"report": "报告解析失败，请检查 API 返回格式。", "questions": []}
 
     quality_prompt = f"""
     你是一位严苛的医疗质控专家。请审查另一位医生对以下患者的诊断报告。
     问诊历史：{context}
-    初诊报告：{doctor_data['report']}
+    初诊报告：{doctor_data.get('report', '暂无报告')}
     任务：
     1. 找出初诊报告中过度诊断、缺乏依据、或者遗漏的危险并发症。
-    2. 如果是复杂病例（复杂度：{complexity}），提供更深入的补充分析。
+    2. 如果是复杂病例，提供更深入的补充分析。
     3. 输出一份【最终审核报告】，必须包含初诊核心内容，并修正错误。
     {ask_instructions}
     请只输出标准 JSON 格式：
-    {{"report": "Markdown格式的最终报告内容", "questions": [ ... 保持和上面同样的结构 ... ]}}
+    {{"report": "Markdown格式的最终报告内容", "questions": [ ... ]}}
     """
     quality_response = call_llm(role_b, "你是一位严苛的医疗质控专家。", quality_prompt, json_mode=True)
+    
+    # 【重点修复】安全提取质控后的数据
     try:
         final_data = json.loads(quality_response.strip().replace("```json", "").replace("```", ""))
+        if not isinstance(final_data, dict) or "report" not in final_data:
+            final_data = doctor_data # 如果质控失败，回退使用初诊数据
     except:
         final_data = doctor_data
         
@@ -158,7 +143,7 @@ def verify_with_pubmed(report_content, role_b):
     
     pubmed_evidence = search_pubmed(search_query)
     if not pubmed_evidence:
-        return report_content + "\n\n【系统提示】：PubMed 中未检索到相关最新文献，报告基于大模型知识库生成。"
+        return report_content + "\n\n【系统提示】：PubMed 中未检索到相关最新文献。"
     
     verify_prompt = f"""
     你是一位极其严谨的医学专家。以下是我们生成的诊断报告：
@@ -185,7 +170,7 @@ with st.sidebar:
         st.rerun()
 
 if not st.session_state.messages:
-    st.info("请在下方描述您的基础症状（系统将根据病情复杂度，动态分配模型进行交叉验证）")
+    st.info("请在下方描述您的基础症状")
     initial_symptom = st.text_area("症状描述：", height=100, key="initial_input")
     
     if st.button("开始智能分析", type="primary"):
@@ -193,7 +178,7 @@ if not st.session_state.messages:
             st.warning("请先输入您的症状哦～")
         else:
             st.session_state.messages.append({"role": "user", "content": initial_symptom})
-            with st.spinner("AI 医生正在调度双模型进行深度分析..."):
+            with st.spinner("AI 医生正在调度模型进行深度分析..."):
                 route_info = evaluate_and_assign(st.session_state.messages)
                 result = generate_report_and_questions(st.session_state.messages, route_info, st.session_state.round)
                 st.session_state.report = result.get("report", "")
@@ -207,7 +192,7 @@ if st.session_state.report:
     st.markdown("---")
 
 if st.session_state.questions and st.session_state.round < 3:
-    st.subheader(f"请您补充以下信息（第 {st.session_state.round + 1} 轮，最多 3 轮）")
+    st.subheader(f"请您补充以下信息（第 {st.session_state.round + 1} 轮）")
     with st.form(key=f"follow_up_form_{st.session_state.round}"):
         answers = {}
         for q in st.session_state.questions:
@@ -237,10 +222,9 @@ if st.session_state.questions and st.session_state.round < 3:
                     st.session_state.messages.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
                     st.rerun()
 
-# 当轮次达到3轮，或者不再有追问问题时，触发 PubMed 校对
 if (st.session_state.round >= 3 or not st.session_state.questions) and st.session_state.report and not st.session_state.pubmed_done:
     st.session_state.pubmed_done = True
-    with st.spinner("正在调用 PubMed 进行终极文献校对（可能耗时 10-15 秒），请稍候..."):
+    with st.spinner("正在调用 PubMed 进行终极文献校对..."):
         route_info = evaluate_and_assign(st.session_state.messages)
         role_b = route_info["role_b_model"]
         verified_report = verify_with_pubmed(st.session_state.report, role_b)
