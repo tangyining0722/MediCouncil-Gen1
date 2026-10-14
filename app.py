@@ -16,6 +16,7 @@ if "report" not in st.session_state: st.session_state.report = ""
 if "questions" not in st.session_state: st.session_state.questions = []
 if "round" not in st.session_state: st.session_state.round = 0
 if "pubmed_done" not in st.session_state: st.session_state.pubmed_done = False
+if "asked_questions" not in st.session_state: st.session_state.asked_questions = [] # 记录问过的问题
 
 def get_api_key(key_name):
     key = os.environ.get(key_name)
@@ -82,11 +83,21 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     role_a = route_info["role_a_model"]
     role_b = route_info["role_b_model"]
     context = "\n".join([f"{'患者' if m['role']=='user' else '医生'}：{m['content']}" for m in messages_history])
+    
+    # 提取已经问过的问题，作为警告发给大模型
+    asked_questions_text = "、".join(st.session_state.asked_questions) if st.session_state.asked_questions else "无"
 
-    ask_instructions = """
-    4. 追问机制：提出最多3个针对性的追问问题。问题必须是选择题形式（提供选项，可多选），或简短填空。
-    输出格式必须包含 JSON 的 questions 数组。
-    """ if current_round < 3 else "4. 已达到最大追问轮次，不要再生成追问，questions 数组必须为空 []。"
+    ask_instructions = ""
+    if current_round < 3:
+        ask_instructions = f"""
+        4. 追问机制：提出最多3个针对性的追问问题。问题必须是选择题形式（提供选项，可多选），或简短填空。
+        5. 【极其重要】你之前已经问过以下问题，绝对不允许再次提问完全一样的问题：
+        历史问题：{asked_questions_text}
+        请根据目前的问诊历史，提出新的、不同的关键问题。
+        如果信息已经足够，或者你无法提出新的问题，请直接将 questions 数组留空 []。
+        """
+    else:
+        ask_instructions = "4. 已达到最大追问轮次，不要再生成追问，questions 数组必须为空 []。"
 
     doctor_prompt = f"""
     你是一位资深全科医生。基于以下问诊历史，生成当前阶段的诊断报告。
@@ -127,7 +138,7 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     except:
         final_data = {}
         
-    # 【核心修复】：清洗问题列表，防止 None 报错
+    # 【核心修复】：清洗问题列表，去重且防报错
     raw_questions = final_data.get("questions", [])
     cleaned_questions = []
     for idx, q in enumerate(raw_questions):
@@ -135,8 +146,12 @@ def generate_report_and_questions(messages_history, route_info, current_round):
         q_text = q.get("text", f"问题 {idx + 1}")
         if not q_text or q_text == "未知问题": 
             q_text = f"请补充相关信息 {idx + 1}"
+        
+        # 硬性去重：如果这个问题在前几轮问过了，直接跳过
+        if q_text in st.session_state.asked_questions:
+            continue
+            
         options = q.get("options", [])
-        # 生成唯一的 ID，绝对不重复
         q_id = q.get("id") or f"q_{uuid.uuid4().hex[:8]}_{idx}"
         cleaned_questions.append({
             "id": q_id,
@@ -144,7 +159,14 @@ def generate_report_and_questions(messages_history, route_info, current_round):
             "options": options
         })
     
-    # 如果质控没有返回报告，就用初诊的兜底
+    # 如果去重后没有新问题了，强制清空 questions 触发 PubMed 结束流程
+    if not cleaned_questions:
+        cleaned_questions = []
+    
+    # 记录这一轮新问的问题
+    for cq in cleaned_questions:
+        st.session_state.asked_questions.append(cq["text"])
+    
     report_text = final_data.get("report") or doctor_data.get("report") or "报告生成异常，请重试。"
     
     return {"report": report_text, "questions": cleaned_questions}
@@ -183,6 +205,7 @@ with st.sidebar:
         st.session_state.questions = []
         st.session_state.round = 0
         st.session_state.pubmed_done = False
+        st.session_state.asked_questions = []
         st.rerun()
 
 if not st.session_state.messages:
@@ -214,7 +237,6 @@ if st.session_state.questions and st.session_state.round < 3:
         for q in st.session_state.questions:
             q_text = q.get("text", "未知问题")
             options = q.get("options", [])
-            # 使用清洗后的 q_id 作为 key，绝对不重复
             q_key = f"key_{q.get('id')}_{st.session_state.round}"
             
             if options:
@@ -225,7 +247,6 @@ if st.session_state.questions and st.session_state.round < 3:
         submit_answers = st.form_submit_button("提交补充信息")
         
         if submit_answers:
-            # 严格校验用户是否回答
             is_valid = True
             for v in answers.values():
                 if isinstance(v, list) and len(v) == 0: is_valid = False
@@ -246,6 +267,7 @@ if st.session_state.questions and st.session_state.round < 3:
                     st.session_state.messages.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
                     st.rerun()
 
+# 触发 PubMed 的条件：轮次达到3轮，或者没有新的追问问题了
 if (st.session_state.round >= 3 or not st.session_state.questions) and st.session_state.report and not st.session_state.pubmed_done:
     st.session_state.pubmed_done = True
     with st.spinner("正在调用 PubMed 进行终极文献校对..."):
@@ -264,6 +286,7 @@ if st.session_state.round >= 3 or (not st.session_state.questions and st.session
         st.session_state.questions = []
         st.session_state.round = 0
         st.session_state.pubmed_done = False
+        st.session_state.asked_questions = []
         st.rerun()
 
 if st.session_state.report:
