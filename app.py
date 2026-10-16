@@ -18,6 +18,7 @@ if "questions" not in st.session_state: st.session_state.questions = []
 if "round" not in st.session_state: st.session_state.round = 0
 if "pubmed_done" not in st.session_state: st.session_state.pubmed_done = False
 if "asked_questions" not in st.session_state: st.session_state.asked_questions = []
+if "model_info" not in st.session_state: st.session_state.model_info = ""
 
 def get_api_key(key_name):
     key = os.environ.get(key_name)
@@ -38,7 +39,7 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
             api_key = get_api_key("DOUBAO_API_KEY")
             if not api_key: return ""
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
-            # 【⚠️ 请替换为你真实的 ep- 开头的接入点 ID ⚠️】
+            # ⚠️ 请在此处填你真实的 ep- 开头接入点 ID
             model_id = "ep-20261016181503-h42sl"
         else:
             return ""
@@ -55,41 +56,32 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
         return ""
 
 # ================= 文献检索模块 =================
-def search_europepmc(query, max_results=2):
+def search_europepmc(query, max_results=3):
     try:
         safe_query = requests.utils.quote(query)
         url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={safe_query}&format=json&resultType=core&pageSize={max_results}"
         res = requests.get(url, timeout=10)
         res.raise_for_status()
-        data = res.json()
-        results = data.get("resultList", {}).get("result", [])
-        abstracts = []
-        for item in results:
-            title = item.get("title", "No Title")
-            abstract = item.get("abstractText", "No Abstract")
-            if abstract:
-                abstracts.append(f"标题：{title}\n摘要：{abstract[:500]}...")
+        results = res.json().get("resultList", {}).get("result", [])
+        abstracts = [f"标题：{item.get('title')}\n摘要：{item.get('abstractText', 'No Abstract')[:600]}..." for item in results if item.get('abstractText')]
         return "\n\n".join(abstracts) if abstracts else ""
     except:
         return ""
 
-def search_pubmed(query, max_results=2):
+def search_pubmed(query, max_results=3):
     try:
         search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={query}&retmode=json&retmax={max_results}"
         res = requests.get(search_url, timeout=10)
-        res.raise_for_status()
         id_list = res.json().get("esearchresult", {}).get("idlist", [])
         if not id_list: return ""
-        ids_str = ",".join(id_list)
-        fetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={ids_str}&retmode=xml"
-        fetch_res = requests.get(fetch_url, timeout=15)
-        root = ET.fromstring(fetch_res.content)
+        fetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={','.join(id_list)}&retmode=xml"
+        root = ET.fromstring(requests.get(fetch_url, timeout=15).content)
         abstracts = []
         for article in root.findall(".//PubmedArticle"):
             title = article.find(".//ArticleTitle").text if article.find(".//ArticleTitle") is not None else "No Title"
             abstract_texts = article.findall(".//AbstractText")
             abstract = " ".join([t.text for t in abstract_texts if t.text]) if abstract_texts else "No Abstract"
-            abstracts.append(f"标题：{title}\n摘要：{abstract[:500]}...")
+            abstracts.append(f"标题：{title}\n摘要：{abstract[:600]}...")
         return "\n\n".join(abstracts) if abstracts else ""
     except:
         return ""
@@ -99,23 +91,8 @@ def evaluate_and_assign(messages_history):
     has_doubao = bool(get_api_key("DOUBAO_API_KEY"))
     if not has_doubao:
         return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "deepseek"}
-    
-    history_text = "".join([f"{'患者' if m['role']=='user' else '医生'}：{m['content']}\n" for m in messages_history])
-    router_prompt = f"""
-    以下是问诊对话历史：{history_text}
-    请分析当前病例的复杂程度。如果症状单一、常见，定义复杂度为 "low"；如果症状涉及多系统、存在潜在风险、定义复杂度为 "high"。
-    根据复杂度，请决定以下角色的分配（必须同时调用两个模型）：
-    - 角色A（主诊医生）：负责生成核心诊断报告。
-    - 角色B（质控专家）：负责严苛审查角色A的报告。
-    请只输出 JSON 格式：{{"complexity": "low/high", "role_a_model": "deepseek/doubao", "role_b_model": "deepseek/doubao"}}
-    """
-    res = call_llm("deepseek", "你是一个医疗分诊调度系统。", router_prompt, json_mode=True)
-    try:
-        data = json.loads(res.strip().replace("```json", "").replace("```", ""))
-        if "role_a_model" not in data or "role_b_model" not in data: raise ValueError("格式错误")
-        return data
-    except:
-        return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "doubao"}
+    # 强制让豆包承担质控专家角色
+    return {"complexity": "high", "role_a_model": "deepseek", "role_b_model": "doubao"}
 
 # ================= 核心逻辑：报告生成与追问 =================
 def generate_report_and_questions(messages_history, route_info, current_round):
@@ -129,21 +106,27 @@ def generate_report_and_questions(messages_history, route_info, current_round):
         ask_instructions = f"""
         4. 追问机制：提出最多3个针对性的追问问题。问题必须是选择题形式（提供选项，可多选），或简短填空。
         5. 你之前已经问过以下问题，绝对不允许再次提问完全一样的问题：{asked_questions_text}
-        6. 除非用户提供了极其详尽、无懈可击的病史，否则你必须提出至少 1 个新的追问问题。
+        6. 【极其重要】所有的追问问题必须放在 JSON 的 `questions` 数组里，绝对禁止将问题直接写在 `report` 正文中！
         """
     else:
         ask_instructions = "4. 已达到最大追问轮次，不要再生成追问，questions 数组必须为空 []。"
 
+    # 优化 Prompt：强制结构精简
     doctor_prompt = f"""
     你是一位资深全科医生。基于以下问诊历史，生成当前阶段的诊断报告。
     问诊历史：{context}
     规则：
-    1. 必须优先输出一份【诊断报告】，包含：预诊断概述、可能疾病及概率排序、就诊建议。
+    1. 必须严格按照以下 Markdown 结构输出，语言精炼，直接给结论，避免长篇大论的论证过程：
+       ## 预诊断概述
+       （一段话总结核心判断）
+       ## 可能疾病及鉴别
+       （按临床优先级排序，用 1. 2. 3. 列出，可附粗糙百分比，例如：1. 腰椎间盘突出 (Lumbar Disc Herniation) - 约40%）
+       ## 就诊建议
+       （包含首诊科室、必要检查、暂缓措施、警示信号）
     2. 必须围绕临床医学、器质性病变进行推理，严禁编造娱乐化诊断。
     3. 当前是第 {current_round + 1} 轮（最多3轮）。
-    4. 【重要格式】在列出“可能疾病及概率排序”时，每个疾病名称后面必须紧跟英文翻译并用括号括起来，例如：腰椎间盘突出 (Lumbar Disc Herniation)。
     {ask_instructions}
-    请只输出标准 JSON 格式：{{"report": "...", "questions": [...]}}
+    请严格只输出标准 JSON 格式：{{"report": "...", "questions": [...]}}
     """
     doctor_response = call_llm(role_a, "你是一位专业的医疗诊断医生。", doctor_prompt, json_mode=True)
     try:
@@ -152,16 +135,22 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     except:
         doctor_data = {}
 
+    # 优化 Prompt：质控专家也必须输出精简结构
     quality_prompt = f"""
-    你是一位严苛的医疗质控专家。请审查另一位医生对以下患者的诊断报告。
+    你是一位严苛的医疗质控专家。请审查另一位医生的诊断报告，并输出修正后的最终版。
     问诊历史：{context}
     初诊报告：{doctor_data.get('report', '暂无报告')}
     任务：
-    1. 找出初诊报告中过度诊断、缺乏依据、或者遗漏的危险并发症。
-    2. 输出一份【最终审核报告】，必须包含初诊核心内容，并修正错误。
+    1. 找出初诊报告中过度诊断、缺乏依据、或者遗漏的危险并发症，并直接修改。
+    2. 【重要格式要求】必须严格按照以下结构输出，语言精炼，绝对不要长篇大论的审计过程：
+       ## 预诊断概述
+       ## 可能疾病及鉴别
+       ## 就诊建议
+       ## 说明
+       （写明为什么做出此修正）
     3. 【重要格式】必须严格保留疾病名称后面的英文翻译括号。
     {ask_instructions}
-    请只输出标准 JSON 格式：{{"report": "...", "questions": [...]}}
+    请严格只输出标准 JSON 格式：{{"report": "...", "questions": [...]}}
     """
     quality_response = call_llm(role_b, "你是一位严苛的医疗质控专家。", quality_prompt, json_mode=True)
     try:
@@ -184,26 +173,27 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     for cq in cleaned_questions:
         st.session_state.asked_questions.append(cq["text"])
     
-    report_text = final_data.get("report")
-    if not report_text:
-        report_text = doctor_data.get("report", "报告生成异常，请重试。")
-        
+    report_text = final_data.get("report") or doctor_data.get("report") or "报告生成异常，请重试。"
+    
+    if "CALL_FAILED" in str(quality_response) or not final_data.get("report"):
+        report_text = doctor_data.get("report", "") + f"\n\n【系统提示】：豆包质控专家未返回有效结果，以上为 DeepSeek 主诊医生的初诊报告。"
+
     return {"report": report_text, "questions": cleaned_questions}
 
-# ================= 终局：多源文献联合核查（加固防断连） =================
+# ================= 终局：多源文献联合核查 =================
 def verify_with_literature(report_content, role_b):
     english_terms = re.findall(r'[\(（]([A-Za-z\s\-]+)[\)）]', report_content)
     search_query = " AND ".join(english_terms[:2]) if english_terms else ""
     
     if not search_query:
-        extract_prompt = f"请从以下报告中，提取出最核心的1个疾病名称的纯英文医学名词（例如：Lumbar Disc Herniation）。仅输出英文，不要任何中文、解释或标点。报告：{report_content[:1000]}"
-        search_query = call_llm(role_b, "你是医学信息提取助手。", extract_prompt).strip()
+        extract_prompt = f"请从以下报告中，提取出最核心的1个疾病名称的纯英文医学名词。仅输出英文，不要任何中文。报告：{report_content[:1000]}"
+        search_query = call_llm("deepseek", "你是医学信息提取助手。", extract_prompt).strip()
         search_query = search_query.replace('"', '').replace("'", "").replace("\n", " ").strip()
         if re.search(r'[\u4e00-\u9fa5]', search_query) or len(search_query) > 60:
             search_query = ""
 
     if not search_query:
-        return report_content + "\n\n【系统提示】：未能提取到有效的英文医学检索词，文献核查跳过。"
+        return report_content + "\n\n## 【文献参考】\n未能提取到有效的英文医学检索词，未检索文献。"
 
     st.toast(f"正在同时检索 Europe PMC 与 PubMed: {search_query}", icon="🔍")
     evidence_list = []
@@ -217,7 +207,7 @@ def verify_with_literature(report_content, role_b):
         evidence_list.append(f"【美国国立医学图书馆 (PubMed) 检索结果】\n{pubmed_evidence}")
 
     if not evidence_list:
-        return report_content + f"\n\n【系统提示】：在 Europe PMC 和 PubMed 中均未检索到 '{search_query}' 相关的最新文献，报告基于大模型知识库生成。"
+        return report_content + f"\n\n## 【文献参考】\n在 Europe PMC 和 PubMed 中均未检索到 '{search_query}' 相关的最新文献。"
     
     combined_evidence = "\n\n".join(evidence_list)
     verify_prompt = f"""
@@ -226,13 +216,16 @@ def verify_with_literature(report_content, role_b):
     同时，我们为您检索到了以下多源医学文献摘要：
     {combined_evidence}
     请综合这些文献证据，对上述报告进行最后一次事实核查与校对。
-    1. 如果文献支持诊断，予以确认。
-    2. 必须在报告末尾增加一个“【文献参考】”段落，列出你参考的文献标题，并务必注明每篇文献的来源数据库。
+    1. 如果文献支持诊断，予以确认。如果文献提示遗漏了严重并发症，直接修改报告。
+    2. 【重要格式要求】必须在报告末尾单独增加一个“## 【文献参考】”段落，列出你参考的文献标题，并务必注明每篇文献的来源数据库（例如：Europe PMC 或 PubMed）。绝对不要将文献直接混在正文里。
     """
     final_verified = call_llm(role_b, "你是一位医学文献核查专家。", verify_prompt)
-    # 如果大模型没有返回结果，直接返回原始报告，防止丢失
-    if not final_verified or "CALL_FAILED" in str(final_verified):
-        return report_content + "\n\n【系统提示】：文献核对模型未返回结果，已保留原报告。"
+    if not final_verified or "CALL_FAILED" in str(final_verified) or len(final_verified) < 50:
+        st.toast("豆包文献校对未响应，切换 DeepSeek 进行文献校对...", icon="🔄")
+        final_verified = call_llm("deepseek", "你是一位医学文献核查专家。", verify_prompt)
+        
+    if not final_verified:
+        return report_content + "\n\n## 【文献参考】\n文献核对模型均未返回结果，已保留原报告。"
     return final_verified
 
 # ================= 界面交互流程 =================
@@ -245,6 +238,7 @@ with st.sidebar:
         st.session_state.round = 0
         st.session_state.pubmed_done = False
         st.session_state.asked_questions = []
+        st.session_state.model_info = ""
         st.rerun()
 
 if not st.session_state.messages:
@@ -258,6 +252,7 @@ if not st.session_state.messages:
             st.session_state.messages.append({"role": "user", "content": initial_symptom})
             with st.spinner("AI 医生正在调度双模型进行深度会诊..."):
                 route_info = evaluate_and_assign(st.session_state.messages)
+                st.session_state.model_info = f"主诊医生：{route_info['role_a_model'].capitalize()} | 质控专家：{route_info['role_b_model'].capitalize()}"
                 result = generate_report_and_questions(st.session_state.messages, route_info, st.session_state.round)
                 st.session_state.report = result.get("report", "")
                 st.session_state.questions = result.get("questions", [])
@@ -265,6 +260,8 @@ if not st.session_state.messages:
                 st.rerun()
 
 if st.session_state.report:
+    if st.session_state.model_info:
+        st.caption(f"🤖 {st.session_state.model_info}")
     st.markdown("### 📋 交叉验证会诊报告")
     st.markdown(st.session_state.report)
     st.markdown("---")
@@ -325,6 +322,7 @@ if st.button("🔄 重新开始一次会诊"):
     st.session_state.round = 0
     st.session_state.pubmed_done = False
     st.session_state.asked_questions = []
+    st.session_state.model_info = ""
     st.rerun()
 
 if st.session_state.report:
