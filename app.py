@@ -26,7 +26,7 @@ def get_api_key(key_name):
         except: pass
     return key
 
-# ================= 底层 API 调用（加固防错，绝不抛出丑陋报错） =================
+# ================= 底层 API 调用 =================
 def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
     try:
         if model_name == "deepseek":
@@ -38,8 +38,7 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
             api_key = get_api_key("DOUBAO_API_KEY")
             if not api_key: return ""
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
-            # 【⚠️ 必须修改 ⚠️】请把下面引号里的内容，换成你在火山引擎创建的 ep- 开头的接入点 ID
-            # 如果不想用豆包，请直接去 Render 删除 DOUBAO_API_KEY 环境变量
+            # 【⚠️ 请替换为你真实的 ep- 开头的接入点 ID ⚠️】
             model_id = "doubao-seed-2.1-lite-260915" 
         else:
             return ""
@@ -53,7 +52,6 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
         )
         return response.choices[0].message.content
     except Exception:
-        # 无论 API 报什么错，一律静默返回空字符串，由上层逻辑降级处理
         return ""
 
 # ================= 文献检索模块 =================
@@ -100,7 +98,6 @@ def search_pubmed(query, max_results=2):
 def evaluate_and_assign(messages_history):
     has_doubao = bool(get_api_key("DOUBAO_API_KEY"))
     if not has_doubao:
-        # 如果没有豆包，强制全部由 DeepSeek 承担
         return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "deepseek"}
     
     history_text = "".join([f"{'患者' if m['role']=='user' else '医生'}：{m['content']}\n" for m in messages_history])
@@ -187,16 +184,14 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     for cq in cleaned_questions:
         st.session_state.asked_questions.append(cq["text"])
     
-    # 【核心降级逻辑】如果质控失败（或豆包报错），直接使用主诊医生的报告，绝不报错
     report_text = final_data.get("report")
-    if not report_text or "API_KEY_MISSING" in str(report_text) or "CALL_FAILED" in str(report_text):
+    if not report_text:
         report_text = doctor_data.get("report", "报告生成异常，请重试。")
         
     return {"report": report_text, "questions": cleaned_questions}
 
-# ================= 终局：多源文献联合核查 =================
+# ================= 终局：多源文献联合核查（加固防断连） =================
 def verify_with_literature(report_content, role_b):
-    # 优先从报告里用正则提取括号里的英文
     english_terms = re.findall(r'[\(（]([A-Za-z\s\-]+)[\)）]', report_content)
     search_query = " AND ".join(english_terms[:2]) if english_terms else ""
     
@@ -234,7 +229,11 @@ def verify_with_literature(report_content, role_b):
     1. 如果文献支持诊断，予以确认。
     2. 必须在报告末尾增加一个“【文献参考】”段落，列出你参考的文献标题，并务必注明每篇文献的来源数据库。
     """
-    return call_llm(role_b, "你是一位医学文献核查专家。", verify_prompt)
+    final_verified = call_llm(role_b, "你是一位医学文献核查专家。", verify_prompt)
+    # 如果大模型没有返回结果，直接返回原始报告，防止丢失
+    if not final_verified or "CALL_FAILED" in str(final_verified):
+        return report_content + "\n\n【系统提示】：文献核对模型未返回结果，已保留原报告。"
+    return final_verified
 
 # ================= 界面交互流程 =================
 with st.sidebar:
