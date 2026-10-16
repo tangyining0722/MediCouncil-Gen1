@@ -4,6 +4,7 @@ import json
 import requests
 import xml.etree.ElementTree as ET
 import uuid
+import re
 from openai import OpenAI
 
 # ================= 页面配置 =================
@@ -54,7 +55,6 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
 
 # ================= 文献检索模块：Europe PMC =================
 def search_europepmc(query, max_results=2):
-    """Europe PMC 检索（国内直连）"""
     try:
         safe_query = requests.utils.quote(query)
         url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={safe_query}&format=json&resultType=core&pageSize={max_results}"
@@ -74,7 +74,6 @@ def search_europepmc(query, max_results=2):
 
 # ================= 文献检索模块：PubMed =================
 def search_pubmed(query, max_results=2):
-    """PubMed 检索（备用）"""
     try:
         search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={query}&retmode=json&retmax={max_results}"
         res = requests.get(search_url, timeout=10)
@@ -196,45 +195,43 @@ def generate_report_and_questions(messages_history, route_info, current_round):
 
 # ================= 终局：多源文献联合核查 =================
 def verify_with_literature(report_content, role_b):
-    # 1. 强制要求大模型提取标准英文医学检索词
     extract_prompt = f"""
-    请从以下报告中，提取出最核心的1-2个疾病名称。
-    【极其重要】必须只输出纯英文医学名词（例如：Piriformis Syndrome），绝不能包含中文、解释、引号或任何多余字符。
-    仅用于文献检索：
-    {report_content}
+    你是一个专业的医学信息提取专家。请仔细阅读以下诊断报告，提取出报告中核心的 1-2 个疾病名称。
+    【绝对严格的格式要求】
+    1. 必须只输出纯英文的医学标准名词（MeSH terms），例如：Piriformis Syndrome, Lumbar Disc Herniation。
+    2. 绝对不能包含中文、解释、标点符号、引号或任何其他多余的文本。
+    3. 如果无法提取，请只输出 "Unknown"。
+    报告内容：
+    {report_content[:1500]}
     """
     search_query = call_llm(role_b, "你是一个医学信息提取助手。", extract_prompt).strip()
-    
-    # 清理可能出现的多余标点
     search_query = search_query.replace('"', '').replace("'", "").replace("\n", " ").strip()
     
-    # 如果提取失败，尝试从报告中直接截取
-    if not search_query or "error" in search_query.lower() or len(search_query) > 100:
-        search_query = report_content[:80].replace("\n", " ").strip()
+    if "Unknown" in search_query or re.search(r'[\u4e00-\u9fa5]', search_query) or len(search_query) > 60:
+        initial_symptoms = st.session_state.messages[0]["content"] if st.session_state.messages else ""
+        fallback_prompt = f"请将以下中文症状翻译为最准确的英文医学检索词，只输出英文，不要任何解释：{initial_symptoms}"
+        search_query = call_llm(role_b, "你是一个医学翻译。", fallback_prompt).strip()
+        if re.search(r'[\u4e00-\u9fa5]', search_query):
+            search_query = "Unknown"
 
-    # 2. 【核心修改】同时调用多个文献库，合并结果
+    if search_query == "Unknown" or not search_query:
+        return report_content + "\n\n【系统提示】：未能从报告中提取到有效的英文医学检索词，文献核查跳过。报告基于大模型知识库生成。"
+
     st.toast(f"正在同时检索 Europe PMC 与 PubMed: {search_query}", icon="🔍")
-    
     evidence_list = []
     
-    # 调用 Europe PMC
     epmc_evidence = search_europepmc(search_query)
     if epmc_evidence:
         evidence_list.append(f"【欧洲文献库 (Europe PMC) 检索结果】\n{epmc_evidence}")
         
-    # 调用 PubMed
     pubmed_evidence = search_pubmed(search_query)
     if pubmed_evidence:
         evidence_list.append(f"【美国国立医学图书馆 (PubMed) 检索结果】\n{pubmed_evidence}")
 
-    # 3. 如果两个库都没查到，优雅降级，绝不报错
     if not evidence_list:
         return report_content + f"\n\n【系统提示】：在 Europe PMC 和 PubMed 中均未检索到 '{search_query}' 相关的最新文献，报告基于大模型知识库生成。"
     
-    # 合并文献证据
     combined_evidence = "\n\n".join(evidence_list)
-    
-    # 4. 让质控专家结合多源文献进行最终校对
     verify_prompt = f"""
     你是一位极其严谨的医学专家。以下是我们生成的诊断报告：
     {report_content}
@@ -245,7 +242,7 @@ def verify_with_literature(report_content, role_b):
     请综合这些文献证据，对上述报告进行最后一次事实核查与校对。
     1. 如果文献支持诊断，予以确认。
     2. 如果文献提示遗漏了严重并发症，或概率排序与文献不符，直接修改报告。
-    3. 必须在报告末尾增加一个“【文献参考】”段落，列出你参考的文献标题，并务必注明每篇文献的来源数据库（如 Europe PMC 或 PubMed）。
+    3. 必须在报告末尾增加一个“【文献参考】”段落，列出你参考的文献标题，并务必注明每篇文献的来源数据库。
     """
     verified_report = call_llm(role_b, "你是一位医学文献核查专家。", verify_prompt)
     return verified_report
@@ -319,7 +316,6 @@ if st.session_state.questions and st.session_state.round < 3:
                     st.session_state.messages.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
                     st.rerun()
 
-# 触发强制多源文献核查
 if (st.session_state.round >= 3 or not st.session_state.questions) and st.session_state.report and not st.session_state.pubmed_done:
     st.session_state.pubmed_done = True
     with st.spinner("正在同时调用 Europe PMC 与 PubMed 进行终极文献综合校对（约 10-15 秒），请稍候..."):
@@ -344,7 +340,7 @@ if st.button("🔄 重新开始一次会诊"):
     st.session_state.asked_questions = []
     st.rerun()
 
-# 下载完整报告
+# ================= 【加固】下载与防断连处理 =================
 if st.session_state.report:
     user_messages = [msg["content"] for msg in st.session_state.messages if msg["role"] == "user"]
     download_content = "# 人工智能辅助会诊报告\n\n"
@@ -361,9 +357,15 @@ if st.session_state.report:
     else:
         download_content = st.session_state.report
 
-    st.download_button(
-        label="📥 下载完整会诊报告 TXT",
-        data=download_content,
-        file_name="ai_consultation_report.txt",
-        mime="text/plain"
-    )
+    # 尝试显示下载按钮，如果连接断开，则以文本框形式兜底展示完整报告
+    try:
+        st.download_button(
+            label="📥 下载完整会诊报告 TXT",
+            data=download_content,
+            file_name="ai_consultation_report.txt",
+            mime="text/plain"
+        )
+    except Exception:
+        st.error("下载链接生成失败（可能是网络波动），请直接复制下方文本框中的完整报告：")
+        st.text_area("完整报告内容（手动复制）", value=download_content, height=300)
+    
