@@ -39,7 +39,7 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
             if not api_key: return ""
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
             # 【⚠️ 请替换为你真实的 ep- 开头的接入点 ID ⚠️】
-            model_id = "doubao-seed-2.1-lite-260915" 
+            model_id = "ep-20261016181503-h42sl"
         else:
             return ""
 
