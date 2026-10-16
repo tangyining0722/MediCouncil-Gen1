@@ -26,21 +26,23 @@ def get_api_key(key_name):
         except: pass
     return key
 
-# ================= 底层 API 调用 =================
+# ================= 底层 API 调用（加固防错，绝不抛出丑陋报错） =================
 def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
     try:
         if model_name == "deepseek":
             api_key = get_api_key("DEEPSEEK_API_KEY")
-            if not api_key: return '{"error": "未配置 DeepSeek API Key"}'
+            if not api_key: return ""
             base_url = "https://api.deepseek.com/v1"
             model_id = "deepseek-chat"
         elif model_name == "doubao":
             api_key = get_api_key("DOUBAO_API_KEY")
-            if not api_key: return '{"error": "豆包 API Key 未配置"}'
+            if not api_key: return ""
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
+            # 【⚠️ 必须修改 ⚠️】请把下面引号里的内容，换成你在火山引擎创建的 ep- 开头的接入点 ID
+            # 如果不想用豆包，请直接去 Render 删除 DOUBAO_API_KEY 环境变量
             model_id = "doubao-seed-2.1-lite-260915" 
         else:
-            return '{"error": "模型名称错误"}'
+            return ""
 
         client = OpenAI(api_key=api_key, base_url=base_url)
         response = client.chat.completions.create(
@@ -50,10 +52,11 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
             response_format={"type": "json_object"} if json_mode else None
         )
         return response.choices[0].message.content
-    except Exception as e:
-        return f'{{"error": "调用失败: {str(e)}"}}'
+    except Exception:
+        # 无论 API 报什么错，一律静默返回空字符串，由上层逻辑降级处理
+        return ""
 
-# ================= 文献检索模块：Europe PMC =================
+# ================= 文献检索模块 =================
 def search_europepmc(query, max_results=2):
     try:
         safe_query = requests.utils.quote(query)
@@ -72,7 +75,6 @@ def search_europepmc(query, max_results=2):
     except:
         return ""
 
-# ================= 文献检索模块：PubMed =================
 def search_pubmed(query, max_results=2):
     try:
         search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={query}&retmode=json&retmax={max_results}"
@@ -98,12 +100,12 @@ def search_pubmed(query, max_results=2):
 def evaluate_and_assign(messages_history):
     has_doubao = bool(get_api_key("DOUBAO_API_KEY"))
     if not has_doubao:
+        # 如果没有豆包，强制全部由 DeepSeek 承担
         return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "deepseek"}
     
     history_text = "".join([f"{'患者' if m['role']=='user' else '医生'}：{m['content']}\n" for m in messages_history])
     router_prompt = f"""
-    以下是问诊对话历史：
-    {history_text}
+    以下是问诊对话历史：{history_text}
     请分析当前病例的复杂程度。如果症状单一、常见，定义复杂度为 "low"；如果症状涉及多系统、存在潜在风险、定义复杂度为 "high"。
     根据复杂度，请决定以下角色的分配（必须同时调用两个模型）：
     - 角色A（主诊医生）：负责生成核心诊断报告。
@@ -129,14 +131,12 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     if current_round < 3:
         ask_instructions = f"""
         4. 追问机制：提出最多3个针对性的追问问题。问题必须是选择题形式（提供选项，可多选），或简短填空。
-        5. 【极其重要】你之前已经问过以下问题，绝对不允许再次提问完全一样的问题：
-        历史问题：{asked_questions_text}
-        6. 【强制要求】除非用户提供了极其详尽、无懈可击的病史（这种情况极少），否则你必须提出至少 1 个新的追问问题，不允许将 questions 数组留空。
+        5. 你之前已经问过以下问题，绝对不允许再次提问完全一样的问题：{asked_questions_text}
+        6. 除非用户提供了极其详尽、无懈可击的病史，否则你必须提出至少 1 个新的追问问题。
         """
     else:
         ask_instructions = "4. 已达到最大追问轮次，不要再生成追问，questions 数组必须为空 []。"
 
-    # 【核心修改】：强约束模型，输出疾病名称时必须带上英文
     doctor_prompt = f"""
     你是一位资深全科医生。基于以下问诊历史，生成当前阶段的诊断报告。
     问诊历史：{context}
@@ -146,11 +146,9 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     3. 当前是第 {current_round + 1} 轮（最多3轮）。
     4. 【重要格式】在列出“可能疾病及概率排序”时，每个疾病名称后面必须紧跟英文翻译并用括号括起来，例如：腰椎间盘突出 (Lumbar Disc Herniation)。
     {ask_instructions}
-    请只输出标准 JSON 格式：
-    {{"report": "Markdown格式的报告内容", "questions": [ {{"id": "q1", "text": "问题1？", "options": ["选项A", "选项B"]}} ]}}
+    请只输出标准 JSON 格式：{{"report": "...", "questions": [...]}}
     """
     doctor_response = call_llm(role_a, "你是一位专业的医疗诊断医生。", doctor_prompt, json_mode=True)
-    
     try:
         doctor_data = json.loads(doctor_response.strip().replace("```json", "").replace("```", ""))
         if not isinstance(doctor_data, dict): doctor_data = {}
@@ -163,15 +161,12 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     初诊报告：{doctor_data.get('report', '暂无报告')}
     任务：
     1. 找出初诊报告中过度诊断、缺乏依据、或者遗漏的危险并发症。
-    2. 如果是复杂病例，提供更深入的补充分析。
-    3. 输出一份【最终审核报告】，必须包含初诊核心内容，并修正错误。
-    4. 【重要格式】必须严格保留疾病名称后面的英文翻译括号，例如：腰椎间盘突出 (Lumbar Disc Herniation)。
+    2. 输出一份【最终审核报告】，必须包含初诊核心内容，并修正错误。
+    3. 【重要格式】必须严格保留疾病名称后面的英文翻译括号。
     {ask_instructions}
-    请只输出标准 JSON 格式：
-    {{"report": "Markdown格式的最终报告内容", "questions": [ ... ]}}
+    请只输出标准 JSON 格式：{{"report": "...", "questions": [...]}}
     """
     quality_response = call_llm(role_b, "你是一位严苛的医疗质控专家。", quality_prompt, json_mode=True)
-    
     try:
         final_data = json.loads(quality_response.strip().replace("```json", "").replace("```", ""))
         if not isinstance(final_data, dict): final_data = {}
@@ -185,7 +180,6 @@ def generate_report_and_questions(messages_history, route_info, current_round):
         q_text = q.get("text", f"问题 {idx + 1}")
         if not q_text or q_text == "未知问题": q_text = f"请补充相关信息 {idx + 1}"
         if q_text in st.session_state.asked_questions: continue
-            
         options = q.get("options", [])
         q_id = q.get("id") or f"q_{uuid.uuid4().hex[:8]}_{idx}"
         cleaned_questions.append({"id": q_id, "text": q_text, "options": options})
@@ -193,35 +187,28 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     for cq in cleaned_questions:
         st.session_state.asked_questions.append(cq["text"])
     
-    report_text = final_data.get("report") or doctor_data.get("report") or "报告生成异常，请重试。"
+    # 【核心降级逻辑】如果质控失败（或豆包报错），直接使用主诊医生的报告，绝不报错
+    report_text = final_data.get("report")
+    if not report_text or "API_KEY_MISSING" in str(report_text) or "CALL_FAILED" in str(report_text):
+        report_text = doctor_data.get("report", "报告生成异常，请重试。")
+        
     return {"report": report_text, "questions": cleaned_questions}
 
-# ================= 终局：多源文献联合核查（正则提取英文） =================
+# ================= 终局：多源文献联合核查 =================
 def verify_with_literature(report_content, role_b):
-    # 【核心修改】：直接从报告里提取括号里的英文词汇，而不是让 AI 凭空提取
-    # 匹配格式如： (Lumbar Disc Herniation) 或 （Lumbar Disc Herniation）
+    # 优先从报告里用正则提取括号里的英文
     english_terms = re.findall(r'[\(（]([A-Za-z\s\-]+)[\)）]', report_content)
+    search_query = " AND ".join(english_terms[:2]) if english_terms else ""
     
-    search_query = ""
-    if english_terms:
-        # 取前两个提取到的英文词
-        search_query = " AND ".join(english_terms[:2])
-    
-    # 如果正则没提取到，再让 AI 去提取（作为备用方案）
     if not search_query:
-        extract_prompt = f"""
-        请从以下报告中，提取出最核心的1个疾病名称的纯英文医学名词（例如：Lumbar Disc Herniation）。
-        仅输出英文，不要任何中文、解释或标点。
-        报告：{report_content[:1000]}
-        """
+        extract_prompt = f"请从以下报告中，提取出最核心的1个疾病名称的纯英文医学名词（例如：Lumbar Disc Herniation）。仅输出英文，不要任何中文、解释或标点。报告：{report_content[:1000]}"
         search_query = call_llm(role_b, "你是医学信息提取助手。", extract_prompt).strip()
         search_query = search_query.replace('"', '').replace("'", "").replace("\n", " ").strip()
-        # 如果还是中文，直接放弃检索
         if re.search(r'[\u4e00-\u9fa5]', search_query) or len(search_query) > 60:
             search_query = ""
 
     if not search_query:
-        return report_content + "\n\n【系统提示】：未能从报告中提取到有效的英文医学检索词，文献核查跳过。报告基于大模型知识库生成。"
+        return report_content + "\n\n【系统提示】：未能提取到有效的英文医学检索词，文献核查跳过。"
 
     st.toast(f"正在同时检索 Europe PMC 与 PubMed: {search_query}", icon="🔍")
     evidence_list = []
@@ -241,17 +228,13 @@ def verify_with_literature(report_content, role_b):
     verify_prompt = f"""
     你是一位极其严谨的医学专家。以下是我们生成的诊断报告：
     {report_content}
-    
-    同时，我们为您检索到了以下多源医学文献摘要（来自不同权威数据库）：
+    同时，我们为您检索到了以下多源医学文献摘要：
     {combined_evidence}
-    
     请综合这些文献证据，对上述报告进行最后一次事实核查与校对。
     1. 如果文献支持诊断，予以确认。
-    2. 如果文献提示遗漏了严重并发症，或概率排序与文献不符，直接修改报告。
-    3. 必须在报告末尾增加一个“【文献参考】”段落，列出你参考的文献标题，并务必注明每篇文献的来源数据库。
+    2. 必须在报告末尾增加一个“【文献参考】”段落，列出你参考的文献标题，并务必注明每篇文献的来源数据库。
     """
-    verified_report = call_llm(role_b, "你是一位医学文献核查专家。", verify_prompt)
-    return verified_report
+    return call_llm(role_b, "你是一位医学文献核查专家。", verify_prompt)
 
 # ================= 界面交互流程 =================
 with st.sidebar:
@@ -313,7 +296,6 @@ if st.session_state.questions and st.session_state.round < 3:
                 formatted_answers = "\n".join([f"问：{k}\n答：{'、'.join(v) if isinstance(v, list) else v}" for k, v in answers.items()])
                 st.session_state.messages.append({"role": "user", "content": f"补充信息：\n{formatted_answers}"})
                 st.session_state.round += 1
-                
                 with st.spinner("AI 医生正在重新评估病情并更新报告..."):
                     route_info = evaluate_and_assign(st.session_state.messages)
                     result = generate_report_and_questions(st.session_state.messages, route_info, st.session_state.round)
@@ -333,7 +315,7 @@ if (st.session_state.round >= 3 or not st.session_state.questions) and st.sessio
         st.rerun()
 
 if st.session_state.round >= 3:
-    st.info("已达到最大追问轮次（3轮）。以上是基于现有信息和多源医学文献核查的最全面分析，请结合报告尽快就医。")
+    st.info("已达到最大追问轮次（3轮）。以上是基于现有信息和多源医学文献核查的最全面分析。")
 elif not st.session_state.questions and st.session_state.pubmed_done:
     st.info("AI 医生认为当前症状信息已经足够明确，无需继续追问，已直接为您生成包含多源文献核查的最终报告。")
 
@@ -346,7 +328,6 @@ if st.button("🔄 重新开始一次会诊"):
     st.session_state.asked_questions = []
     st.rerun()
 
-# 下载与防断连处理
 if st.session_state.report:
     user_messages = [msg["content"] for msg in st.session_state.messages if msg["role"] == "user"]
     download_content = "# 人工智能辅助会诊报告\n\n"
@@ -355,8 +336,7 @@ if st.session_state.report:
         if len(user_messages) > 1:
             download_content += "## 二、智能追问与患者回答\n"
             for idx, qa in enumerate(user_messages[1:], 1):
-                qa_clean = qa.replace("补充信息：\n", "").strip()
-                qa_clean = qa_clean.replace("问：", "\n**问：** ").replace("答：", "**答：** ")
+                qa_clean = qa.replace("补充信息：\n", "").strip().replace("问：", "\n**问：** ").replace("答：", "**答：** ")
                 download_content += f"### 第 {idx} 轮追问\n{qa_clean}\n"
             download_content += "\n"
         download_content += "## 三、最终循证会诊报告\n" + st.session_state.report
@@ -364,12 +344,7 @@ if st.session_state.report:
         download_content = st.session_state.report
 
     try:
-        st.download_button(
-            label="📥 下载完整会诊报告 TXT",
-            data=download_content,
-            file_name="ai_consultation_report.txt",
-            mime="text/plain"
-        )
+        st.download_button("📥 下载完整会诊报告 TXT", download_content, "ai_consultation_report.txt", "text/plain")
     except Exception:
-        st.error("下载链接生成失败（可能是网络波动），请直接复制下方文本框中的完整报告：")
+        st.error("下载链接生成失败，请直接复制下方文本框：")
         st.text_area("完整报告内容（手动复制）", value=download_content, height=300)
