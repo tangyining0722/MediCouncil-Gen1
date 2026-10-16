@@ -52,15 +52,35 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
     except Exception as e:
         return f'{{"error": "调用失败: {str(e)}"}}'
 
-# ================= PubMed 检索模块 =================
-def search_pubmed(query, max_results=3):
+# ================= 文献检索模块：Europe PMC =================
+def search_europepmc(query, max_results=2):
+    """Europe PMC 检索（国内直连）"""
+    try:
+        safe_query = requests.utils.quote(query)
+        url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={safe_query}&format=json&resultType=core&pageSize={max_results}"
+        res = requests.get(url, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        results = data.get("resultList", {}).get("result", [])
+        abstracts = []
+        for item in results:
+            title = item.get("title", "No Title")
+            abstract = item.get("abstractText", "No Abstract")
+            if abstract:
+                abstracts.append(f"标题：{title}\n摘要：{abstract[:500]}...")
+        return "\n\n".join(abstracts) if abstracts else ""
+    except:
+        return ""
+
+# ================= 文献检索模块：PubMed =================
+def search_pubmed(query, max_results=2):
+    """PubMed 检索（备用）"""
     try:
         search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={query}&retmode=json&retmax={max_results}"
         res = requests.get(search_url, timeout=10)
         res.raise_for_status()
         id_list = res.json().get("esearchresult", {}).get("idlist", [])
         if not id_list: return ""
-
         ids_str = ",".join(id_list)
         fetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={ids_str}&retmode=xml"
         fetch_res = requests.get(fetch_url, timeout=15)
@@ -70,8 +90,8 @@ def search_pubmed(query, max_results=3):
             title = article.find(".//ArticleTitle").text if article.find(".//ArticleTitle") is not None else "No Title"
             abstract_texts = article.findall(".//AbstractText")
             abstract = " ".join([t.text for t in abstract_texts if t.text]) if abstract_texts else "No Abstract"
-            abstracts.append(f"标题：{title}\n摘要：{abstract[:600]}...")
-        return "\n\n".join(abstracts)
+            abstracts.append(f"标题：{title}\n摘要：{abstract[:500]}...")
+        return "\n\n".join(abstracts) if abstracts else ""
     except:
         return ""
 
@@ -174,27 +194,58 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     report_text = final_data.get("report") or doctor_data.get("report") or "报告生成异常，请重试。"
     return {"report": report_text, "questions": cleaned_questions}
 
-# ================= 终局：PubMed 校对 =================
-def verify_with_pubmed(report_content, role_b):
-    extract_prompt = f"请从以下报告中，提取出最核心的1-2个疾病名称，必须是标准的英文医学名词（例如 Tension-type headache），仅用于PubMed检索，不要有任何多余文字：\n{report_content}"
+# ================= 终局：多源文献联合核查 =================
+def verify_with_literature(report_content, role_b):
+    # 1. 强制要求大模型提取标准英文医学检索词
+    extract_prompt = f"""
+    请从以下报告中，提取出最核心的1-2个疾病名称。
+    【极其重要】必须只输出纯英文医学名词（例如：Piriformis Syndrome），绝不能包含中文、解释、引号或任何多余字符。
+    仅用于文献检索：
+    {report_content}
+    """
     search_query = call_llm(role_b, "你是一个医学信息提取助手。", extract_prompt).strip()
     
-    if not search_query or "error" in search_query.lower():
-        return report_content + "\n\n【系统提示】：未能提取到有效的医学检索词，跳过文献核查。"
+    # 清理可能出现的多余标点
+    search_query = search_query.replace('"', '').replace("'", "").replace("\n", " ").strip()
     
+    # 如果提取失败，尝试从报告中直接截取
+    if not search_query or "error" in search_query.lower() or len(search_query) > 100:
+        search_query = report_content[:80].replace("\n", " ").strip()
+
+    # 2. 【核心修改】同时调用多个文献库，合并结果
+    st.toast(f"正在同时检索 Europe PMC 与 PubMed: {search_query}", icon="🔍")
+    
+    evidence_list = []
+    
+    # 调用 Europe PMC
+    epmc_evidence = search_europepmc(search_query)
+    if epmc_evidence:
+        evidence_list.append(f"【欧洲文献库 (Europe PMC) 检索结果】\n{epmc_evidence}")
+        
+    # 调用 PubMed
     pubmed_evidence = search_pubmed(search_query)
-    if not pubmed_evidence:
-        return report_content + "\n\n【系统提示】：PubMed 中未检索到相关最新文献。"
+    if pubmed_evidence:
+        evidence_list.append(f"【美国国立医学图书馆 (PubMed) 检索结果】\n{pubmed_evidence}")
+
+    # 3. 如果两个库都没查到，优雅降级，绝不报错
+    if not evidence_list:
+        return report_content + f"\n\n【系统提示】：在 Europe PMC 和 PubMed 中均未检索到 '{search_query}' 相关的最新文献，报告基于大模型知识库生成。"
     
+    # 合并文献证据
+    combined_evidence = "\n\n".join(evidence_list)
+    
+    # 4. 让质控专家结合多源文献进行最终校对
     verify_prompt = f"""
     你是一位极其严谨的医学专家。以下是我们生成的诊断报告：
     {report_content}
-    同时，我们在 PubMed 上检索到了以下相关医学文献摘要：
-    {pubmed_evidence}
-    请结合这些文献证据，对上述报告进行最后一次事实核查与校对。
+    
+    同时，我们为您检索到了以下多源医学文献摘要（来自不同权威数据库）：
+    {combined_evidence}
+    
+    请综合这些文献证据，对上述报告进行最后一次事实核查与校对。
     1. 如果文献支持诊断，予以确认。
     2. 如果文献提示遗漏了严重并发症，或概率排序与文献不符，直接修改报告。
-    3. 必须在报告末尾增加一个“【文献参考】”段落，列出你参考的文献标题。
+    3. 必须在报告末尾增加一个“【文献参考】”段落，列出你参考的文献标题，并务必注明每篇文献的来源数据库（如 Europe PMC 或 PubMed）。
     """
     verified_report = call_llm(role_b, "你是一位医学文献核查专家。", verify_prompt)
     return verified_report
@@ -268,67 +319,48 @@ if st.session_state.questions and st.session_state.round < 3:
                     st.session_state.messages.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
                     st.rerun()
 
+# 触发强制多源文献核查
 if (st.session_state.round >= 3 or not st.session_state.questions) and st.session_state.report and not st.session_state.pubmed_done:
     st.session_state.pubmed_done = True
-    with st.spinner("正在调用 PubMed 进行终极文献校对（约需 10-15 秒），请稍候..."):
+    with st.spinner("正在同时调用 Europe PMC 与 PubMed 进行终极文献综合校对（约 10-15 秒），请稍候..."):
         route_info = evaluate_and_assign(st.session_state.messages)
         role_b = route_info["role_b_model"]
-        verified_report = verify_with_pubmed(st.session_state.report, role_b)
+        verified_report = verify_with_literature(st.session_state.report, role_b)
         st.session_state.report = verified_report
         st.session_state.messages.append({"role": "assistant", "content": json.dumps({"report": verified_report, "questions": []})})
         st.rerun()
 
-# 优化文案
 if st.session_state.round >= 3:
-    st.info("已达到最大追问轮次（3轮）。以上是基于现有信息和医学文献核查的最全面分析，请结合报告尽快就医。")
-    if st.button("🔄 重新开始一次会诊"):
-        st.session_state.messages = []
-        st.session_state.report = ""
-        st.session_state.questions = []
-        st.session_state.round = 0
-        st.session_state.pubmed_done = False
-        st.session_state.asked_questions = []
-        st.rerun()
+    st.info("已达到最大追问轮次（3轮）。以上是基于现有信息和多源医学文献核查的最全面分析，请结合报告尽快就医。")
 elif not st.session_state.questions and st.session_state.pubmed_done:
-    st.info("AI 医生认为当前症状信息已经足够明确，无需继续追问，已直接为您生成包含文献核查的最终报告。")
-    if st.button("🔄 重新开始一次会诊"):
-        st.session_state.messages = []
-        st.session_state.report = ""
-        st.session_state.questions = []
-        st.session_state.round = 0
-        st.session_state.pubmed_done = False
-        st.session_state.asked_questions = []
-        st.rerun()
+    st.info("AI 医生认为当前症状信息已经足够明确，无需继续追问，已直接为您生成包含多源文献核查的最终报告。")
 
-# ================= 【核心修改】构造完整报告用于下载 =================
+if st.button("🔄 重新开始一次会诊"):
+    st.session_state.messages = []
+    st.session_state.report = ""
+    st.session_state.questions = []
+    st.session_state.round = 0
+    st.session_state.pubmed_done = False
+    st.session_state.asked_questions = []
+    st.rerun()
+
+# 下载完整报告
 if st.session_state.report:
-    # 提取用户的所有输入（第一条是主诉，后面的是追问回答）
     user_messages = [msg["content"] for msg in st.session_state.messages if msg["role"] == "user"]
-    
     download_content = "# 人工智能辅助会诊报告\n\n"
-    
     if user_messages:
-        # 1. 患者初始主诉
-        download_content += "## 一、患者初始主诉\n"
-        download_content += f"{user_messages[0]}\n\n"
-        
-        # 2. 多轮追问记录
+        download_content += "## 一、患者初始主诉\n" + f"{user_messages[0]}\n\n"
         if len(user_messages) > 1:
             download_content += "## 二、智能追问与患者回答\n"
             for idx, qa in enumerate(user_messages[1:], 1):
                 qa_clean = qa.replace("补充信息：\n", "").strip()
-                # 稍微排版好看一点
                 qa_clean = qa_clean.replace("问：", "\n**问：** ").replace("答：", "**答：** ")
                 download_content += f"### 第 {idx} 轮追问\n{qa_clean}\n"
             download_content += "\n"
-            
-        # 3. 最终会诊报告
-        download_content += "## 三、最终循证会诊报告\n"
-        download_content += st.session_state.report
+        download_content += "## 三、最终循证会诊报告\n" + st.session_state.report
     else:
-        download_content = st.session_state.report # 兜底
+        download_content = st.session_state.report
 
-    # 渲染下载按钮
     st.download_button(
         label="📥 下载完整会诊报告 TXT",
         data=download_content,
