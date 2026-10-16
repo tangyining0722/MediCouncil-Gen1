@@ -136,6 +136,7 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     else:
         ask_instructions = "4. 已达到最大追问轮次，不要再生成追问，questions 数组必须为空 []。"
 
+    # 【核心修改】：强约束模型，输出疾病名称时必须带上英文
     doctor_prompt = f"""
     你是一位资深全科医生。基于以下问诊历史，生成当前阶段的诊断报告。
     问诊历史：{context}
@@ -143,6 +144,7 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     1. 必须优先输出一份【诊断报告】，包含：预诊断概述、可能疾病及概率排序、就诊建议。
     2. 必须围绕临床医学、器质性病变进行推理，严禁编造娱乐化诊断。
     3. 当前是第 {current_round + 1} 轮（最多3轮）。
+    4. 【重要格式】在列出“可能疾病及概率排序”时，每个疾病名称后面必须紧跟英文翻译并用括号括起来，例如：腰椎间盘突出 (Lumbar Disc Herniation)。
     {ask_instructions}
     请只输出标准 JSON 格式：
     {{"report": "Markdown格式的报告内容", "questions": [ {{"id": "q1", "text": "问题1？", "options": ["选项A", "选项B"]}} ]}}
@@ -163,6 +165,7 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     1. 找出初诊报告中过度诊断、缺乏依据、或者遗漏的危险并发症。
     2. 如果是复杂病例，提供更深入的补充分析。
     3. 输出一份【最终审核报告】，必须包含初诊核心内容，并修正错误。
+    4. 【重要格式】必须严格保留疾病名称后面的英文翻译括号，例如：腰椎间盘突出 (Lumbar Disc Herniation)。
     {ask_instructions}
     请只输出标准 JSON 格式：
     {{"report": "Markdown格式的最终报告内容", "questions": [ ... ]}}
@@ -193,28 +196,31 @@ def generate_report_and_questions(messages_history, route_info, current_round):
     report_text = final_data.get("report") or doctor_data.get("report") or "报告生成异常，请重试。"
     return {"report": report_text, "questions": cleaned_questions}
 
-# ================= 终局：多源文献联合核查 =================
+# ================= 终局：多源文献联合核查（正则提取英文） =================
 def verify_with_literature(report_content, role_b):
-    extract_prompt = f"""
-    你是一个专业的医学信息提取专家。请仔细阅读以下诊断报告，提取出报告中核心的 1-2 个疾病名称。
-    【绝对严格的格式要求】
-    1. 必须只输出纯英文的医学标准名词（MeSH terms），例如：Piriformis Syndrome, Lumbar Disc Herniation。
-    2. 绝对不能包含中文、解释、标点符号、引号或任何其他多余的文本。
-    3. 如果无法提取，请只输出 "Unknown"。
-    报告内容：
-    {report_content[:1500]}
-    """
-    search_query = call_llm(role_b, "你是一个医学信息提取助手。", extract_prompt).strip()
-    search_query = search_query.replace('"', '').replace("'", "").replace("\n", " ").strip()
+    # 【核心修改】：直接从报告里提取括号里的英文词汇，而不是让 AI 凭空提取
+    # 匹配格式如： (Lumbar Disc Herniation) 或 （Lumbar Disc Herniation）
+    english_terms = re.findall(r'[\(（]([A-Za-z\s\-]+)[\)）]', report_content)
     
-    if "Unknown" in search_query or re.search(r'[\u4e00-\u9fa5]', search_query) or len(search_query) > 60:
-        initial_symptoms = st.session_state.messages[0]["content"] if st.session_state.messages else ""
-        fallback_prompt = f"请将以下中文症状翻译为最准确的英文医学检索词，只输出英文，不要任何解释：{initial_symptoms}"
-        search_query = call_llm(role_b, "你是一个医学翻译。", fallback_prompt).strip()
-        if re.search(r'[\u4e00-\u9fa5]', search_query):
-            search_query = "Unknown"
+    search_query = ""
+    if english_terms:
+        # 取前两个提取到的英文词
+        search_query = " AND ".join(english_terms[:2])
+    
+    # 如果正则没提取到，再让 AI 去提取（作为备用方案）
+    if not search_query:
+        extract_prompt = f"""
+        请从以下报告中，提取出最核心的1个疾病名称的纯英文医学名词（例如：Lumbar Disc Herniation）。
+        仅输出英文，不要任何中文、解释或标点。
+        报告：{report_content[:1000]}
+        """
+        search_query = call_llm(role_b, "你是医学信息提取助手。", extract_prompt).strip()
+        search_query = search_query.replace('"', '').replace("'", "").replace("\n", " ").strip()
+        # 如果还是中文，直接放弃检索
+        if re.search(r'[\u4e00-\u9fa5]', search_query) or len(search_query) > 60:
+            search_query = ""
 
-    if search_query == "Unknown" or not search_query:
+    if not search_query:
         return report_content + "\n\n【系统提示】：未能从报告中提取到有效的英文医学检索词，文献核查跳过。报告基于大模型知识库生成。"
 
     st.toast(f"正在同时检索 Europe PMC 与 PubMed: {search_query}", icon="🔍")
@@ -340,7 +346,7 @@ if st.button("🔄 重新开始一次会诊"):
     st.session_state.asked_questions = []
     st.rerun()
 
-# ================= 【加固】下载与防断连处理 =================
+# 下载与防断连处理
 if st.session_state.report:
     user_messages = [msg["content"] for msg in st.session_state.messages if msg["role"] == "user"]
     download_content = "# 人工智能辅助会诊报告\n\n"
@@ -357,7 +363,6 @@ if st.session_state.report:
     else:
         download_content = st.session_state.report
 
-    # 尝试显示下载按钮，如果连接断开，则以文本框形式兜底展示完整报告
     try:
         st.download_button(
             label="📥 下载完整会诊报告 TXT",
@@ -368,4 +373,3 @@ if st.session_state.report:
     except Exception:
         st.error("下载链接生成失败（可能是网络波动），请直接复制下方文本框中的完整报告：")
         st.text_area("完整报告内容（手动复制）", value=download_content, height=300)
-    
