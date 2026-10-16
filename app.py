@@ -37,7 +37,6 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
             api_key = get_api_key("DOUBAO_API_KEY")
             if not api_key: return '{"error": "豆包 API Key 未配置"}'
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
-            # 若豆包报错 404，请去火山引擎创建接入点，将 ep- 开头的 ID 替换这里
             model_id = "doubao-seed-2.1-lite-260915" 
         else:
             return '{"error": "模型名称错误"}'
@@ -113,7 +112,7 @@ def generate_report_and_questions(messages_history, route_info, current_round):
         4. 追问机制：提出最多3个针对性的追问问题。问题必须是选择题形式（提供选项，可多选），或简短填空。
         5. 【极其重要】你之前已经问过以下问题，绝对不允许再次提问完全一样的问题：
         历史问题：{asked_questions_text}
-        请根据目前的问诊历史，提出新的、不同的关键问题。如果信息已经足够，请直接将 questions 数组留空 []。
+        6. 【强制要求】除非用户提供了极其详尽、无懈可击的病史（这种情况极少），否则你必须提出至少 1 个新的追问问题，不允许将 questions 数组留空。
         """
     else:
         ask_instructions = "4. 已达到最大追问轮次，不要再生成追问，questions 数组必须为空 []。"
@@ -279,7 +278,8 @@ if (st.session_state.round >= 3 or not st.session_state.questions) and st.sessio
         st.session_state.messages.append({"role": "assistant", "content": json.dumps({"report": verified_report, "questions": []})})
         st.rerun()
 
-if st.session_state.round >= 3 or (not st.session_state.questions and st.session_state.pubmed_done):
+# 优化文案
+if st.session_state.round >= 3:
     st.info("已达到最大追问轮次（3轮）。以上是基于现有信息和医学文献核查的最全面分析，请结合报告尽快就医。")
     if st.button("🔄 重新开始一次会诊"):
         st.session_state.messages = []
@@ -289,6 +289,49 @@ if st.session_state.round >= 3 or (not st.session_state.questions and st.session
         st.session_state.pubmed_done = False
         st.session_state.asked_questions = []
         st.rerun()
+elif not st.session_state.questions and st.session_state.pubmed_done:
+    st.info("AI 医生认为当前症状信息已经足够明确，无需继续追问，已直接为您生成包含文献核查的最终报告。")
+    if st.button("🔄 重新开始一次会诊"):
+        st.session_state.messages = []
+        st.session_state.report = ""
+        st.session_state.questions = []
+        st.session_state.round = 0
+        st.session_state.pubmed_done = False
+        st.session_state.asked_questions = []
+        st.rerun()
 
+# ================= 【核心修改】构造完整报告用于下载 =================
 if st.session_state.report:
-    st.download_button("下载会诊报告 TXT", st.session_state.report, "ai_consultation_report.txt", "text/plain")
+    # 提取用户的所有输入（第一条是主诉，后面的是追问回答）
+    user_messages = [msg["content"] for msg in st.session_state.messages if msg["role"] == "user"]
+    
+    download_content = "# 人工智能辅助会诊报告\n\n"
+    
+    if user_messages:
+        # 1. 患者初始主诉
+        download_content += "## 一、患者初始主诉\n"
+        download_content += f"{user_messages[0]}\n\n"
+        
+        # 2. 多轮追问记录
+        if len(user_messages) > 1:
+            download_content += "## 二、智能追问与患者回答\n"
+            for idx, qa in enumerate(user_messages[1:], 1):
+                qa_clean = qa.replace("补充信息：\n", "").strip()
+                # 稍微排版好看一点
+                qa_clean = qa_clean.replace("问：", "\n**问：** ").replace("答：", "**答：** ")
+                download_content += f"### 第 {idx} 轮追问\n{qa_clean}\n"
+            download_content += "\n"
+            
+        # 3. 最终会诊报告
+        download_content += "## 三、最终循证会诊报告\n"
+        download_content += st.session_state.report
+    else:
+        download_content = st.session_state.report # 兜底
+
+    # 渲染下载按钮
+    st.download_button(
+        label="📥 下载完整会诊报告 TXT",
+        data=download_content,
+        file_name="ai_consultation_report.txt",
+        mime="text/plain"
+    )
