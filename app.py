@@ -8,8 +8,8 @@ import re
 from openai import OpenAI
 
 # ================= 页面配置 =================
-st.set_page_config(page_title="人工智能辅助会诊系统", layout="wide")
-st.title("人工智能辅助会诊系统")
+st.set_page_config(page_title="辅助肿瘤会诊人工智能体", layout="wide")
+st.title("辅助肿瘤会诊人工智能体")
 
 # ================= 状态管理初始化 =================
 if "messages" not in st.session_state: st.session_state.messages = []
@@ -40,8 +40,8 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
             api_key = get_api_key("DOUBAO_API_KEY")
             if not api_key: return ""
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
-            # ⚠️ 请在此处填你真实的 ep- 开头接入点 ID
-            model_id = "ep-20261016181503-h42sl"
+            # ⚠️ 请在此处填你真实的 ep- 开头接入点 ID ⚠️
+            model_id = "ep-2024061112345-abcde" 
         else:
             return ""
 
@@ -97,7 +97,23 @@ def evaluate_and_assign(messages_history):
     has_doubao = bool(get_api_key("DOUBAO_API_KEY"))
     if not has_doubao:
         return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "deepseek"}
-    return {"complexity": "high", "role_a_model": "deepseek", "role_b_model": "doubao"}
+    
+    history_text = "".join([f"{'患者' if m['role']=='user' else '医生'}：{m['content']}\n" for m in messages_history])
+    router_prompt = f"""
+    以下是问诊对话历史：{history_text}
+    请分析当前病例的复杂程度。如果症状单一、常见，定义复杂度为 "low"；如果症状涉及多系统、存在潜在风险、定义复杂度为 "high"。
+    根据复杂度，请决定以下角色的分配（必须同时调用两个模型）：
+    - 角色A（主诊医生）：负责生成核心诊断报告。
+    - 角色B（质控专家）：负责严苛审查角色A的报告。
+    请只输出 JSON 格式：{{"complexity": "low/high", "role_a_model": "deepseek/doubao", "role_b_model": "deepseek/doubao"}}
+    """
+    res = call_llm("deepseek", "你是一个医疗分诊调度系统。", router_prompt, json_mode=True)
+    try:
+        data = json.loads(res.strip().replace("```json", "").replace("```", ""))
+        if "role_a_model" not in data or "role_b_model" not in data: raise ValueError("格式错误")
+        return data
+    except:
+        return {"complexity": "low", "role_a_model": "deepseek", "role_b_model": "doubao"}
 
 # ================= 核心逻辑：报告生成与追问 =================
 def generate_report_and_questions(messages_history, route_info, current_round):
@@ -117,7 +133,7 @@ def generate_report_and_questions(messages_history, route_info, current_round):
         ask_instructions = "4. 已达到最大追问轮次，不要再生成追问，questions 数组必须为空 []。"
 
     doctor_prompt = f"""
-    你是一位资深全科医生。基于以下问诊历史，生成当前阶段的诊断报告。
+    你是一位资深肿瘤科全科医生。基于以下问诊历史，生成当前阶段的诊断报告。
     问诊历史：{context}
     规则：
     1. 必须严格按照以下 Markdown 结构输出，语言精炼：
@@ -125,7 +141,7 @@ def generate_report_and_questions(messages_history, route_info, current_round):
        ## 可能疾病及鉴别
        ## 就诊建议
        ## 说明
-    2. 必须围绕临床医学、器质性病变进行推理。
+    2. 必须围绕临床医学、器质性病变进行推理，严禁编造娱乐化诊断。
     3. 当前是第 {current_round + 1} 轮（最多3轮）。
     {ask_instructions}
     请严格只输出标准 JSON 格式：{{"report": "...", "questions": [...]}}
@@ -138,7 +154,7 @@ def generate_report_and_questions(messages_history, route_info, current_round):
         doctor_data = {}
 
     quality_prompt = f"""
-    你是一位严苛的医疗质控专家。请审查另一位医生的诊断报告，并输出修正后的最终版。
+    你是一位严苛的肿瘤科医疗质控专家。请审查另一位医生的诊断报告，并输出修正后的最终版。
     问诊历史：{context}
     初诊报告：{doctor_data.get('report', '暂无报告')}
     任务：
@@ -190,7 +206,6 @@ def verify_with_literature(report_content, role_b):
         if re.search(r'[\u4e00-\u9fa5]', search_query) or len(search_query) > 60:
             search_query = ""
 
-    # 如果检索词失败，直接返回原报告
     if not search_query:
         return report_content, ["未能提取到有效的英文医学检索词，未检索文献。"]
 
@@ -203,10 +218,9 @@ def verify_with_literature(report_content, role_b):
     if not evidence_list:
         return report_content, [f"在 Europe PMC 和 PubMed 中均未检索到 '{search_query}' 相关的最新文献。"]
 
-    # 让大模型结合文献修改正文（不要求它加文献）
     combined_evidence = "\n\n".join(evidence_list)
     verify_prompt = f"""
-    你是一位极其严谨的医学专家。以下是我们生成的诊断报告：
+    你是一位极其严谨的肿瘤医学专家。以下是我们生成的诊断报告：
     {report_content}
     同时，我们为您检索到了以下多源医学文献摘要：
     {combined_evidence}
@@ -221,7 +235,6 @@ def verify_with_literature(report_content, role_b):
     if not final_verified:
         final_verified = report_content
 
-    # 强制在最后拼接文献
     return final_verified, evidence_list
 
 # ================= 界面交互流程 =================
@@ -261,7 +274,6 @@ if st.session_state.report:
         st.caption(f"🤖 {st.session_state.model_info}")
     st.markdown("### 📋 交叉验证会诊报告")
     st.markdown(st.session_state.report)
-    # 在页面单独展示文献列表
     if st.session_state.references_list:
         st.markdown("### 📚 参考文献（已检索并核对）")
         for ref in st.session_state.references_list:
@@ -331,7 +343,7 @@ if st.button("🔄 重新开始一次会诊"):
 
 if st.session_state.report:
     user_messages = [msg["content"] for msg in st.session_state.messages if msg["role"] == "user"]
-    download_content = "# 人工智能辅助会诊报告\n\n"
+    download_content = "# 辅助肿瘤会诊人工智能体报告\n\n"
     if user_messages:
         download_content += "## 一、患者初始主诉\n" + f"{user_messages[0]}\n\n"
         if len(user_messages) > 1:
@@ -349,7 +361,7 @@ if st.session_state.report:
         download_content = st.session_state.report
 
     try:
-        st.download_button("📥 下载完整会诊报告 TXT", download_content, "ai_consultation_report.txt", "text/plain")
+        st.download_button("📥 下载完整肿瘤会诊报告 TXT", download_content, "tumor_consultation_report.txt", "text/plain")
     except Exception:
         st.error("下载链接生成失败，请直接复制下方文本框：")
         st.text_area("完整报告内容（手动复制）", value=download_content, height=300)
