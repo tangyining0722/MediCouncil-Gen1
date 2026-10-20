@@ -8,8 +8,8 @@ import re
 from openai import OpenAI
 
 # ================= 页面配置 =================
-st.set_page_config(page_title="辅助肿瘤会诊人工智能体", layout="wide")
-st.title("辅助肿瘤会诊人工智能体")
+st.set_page_config(page_title="肿瘤辅助诊断智能体", layout="wide")
+st.title("肿瘤辅助诊断智能体")
 
 # ================= 状态管理初始化 =================
 if "messages" not in st.session_state: st.session_state.messages = []
@@ -41,7 +41,7 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False):
             if not api_key: return ""
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
             # ⚠️ 请在此处填你真实的 ep- 开头接入点 ID ⚠️
-            model_id = "ep-2024061112345-abcde" 
+            model_id = "ep-20261016181503-h42sl" 
         else:
             return ""
 
